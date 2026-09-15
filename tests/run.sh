@@ -10,7 +10,7 @@
 # files in tests/fixtures/. Full audits then run under `set -euo pipefail`.
 
 # shellcheck source-path=SCRIPTDIR
-# shellcheck disable=SC2329  # scenario_* and stub functions are invoked indirectly
+# shellcheck disable=SC2317,SC2329  # scenario_* and stub functions are invoked indirectly (SC2317 on shellcheck <0.10, SC2329 on >=0.10)
 set -uo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
