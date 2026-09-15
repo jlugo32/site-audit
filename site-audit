@@ -1,0 +1,882 @@
+#!/usr/bin/env bash
+# site-audit - external, non-intrusive security checkup for a website.
+#
+# Everything checked here is what a stranger on the internet can already see:
+# DNS lookups, a handful of HTTPS GET/POST requests and TCP connects. No login,
+# no agent on the target, no exploit attempts.
+#
+#   site-audit example.com                  terminal report
+#   site-audit example.com --md report.md   also save a markdown report
+#   site-audit example.com --json           machine-readable JSON on stdout
+#   site-audit example.com --fail-under 75  exit 1 when the score is below 75
+#
+# Only scan domains you own or are explicitly authorised to test.
+#
+# Layout of this file:
+#   1. constants + finding store      4. network layer (thin wrappers, stubbable)
+#   2. pure helpers (parsing, maths)  5. checks (network -> helpers -> findings)
+#   3. CLI parsing + validation       6. rendering (terminal / markdown / JSON)
+#
+# The file can be sourced without running anything (see the guard at the end),
+# which is how tests/run.sh unit-tests the helpers and replays fixture data.
+
+readonly SITE_AUDIT_VERSION="1.0.0"
+
+# Exit codes
+readonly EXIT_OK=0            # audit ran (and score >= --fail-under, if given)
+readonly EXIT_BELOW_THRESHOLD=1
+readonly EXIT_USAGE=2
+readonly EXIT_MISSING_DEPS=3
+readonly EXIT_NO_RESOLVE=4
+
+# Scoring model
+readonly PENALTY_CRITICAL=15
+readonly PENALTY_WARNING=5
+
+# Ports probed when the origin server is directly reachable.
+readonly PROBE_PORTS="21 22 23 25 110 143 465 587 993 995 2082 2083 2086 2087 3306 5432 6379 7080 8080 8090 8443 8888 9090 10000 27017"
+# Subset that should never face the whole internet.
+readonly RISKY_PORTS=" 21 23 2082 2086 3306 5432 6379 7080 8080 8090 8443 8888 9090 10000 27017 "
+readonly DKIM_SELECTORS="default google selector1 selector2 k1 k2 k3 mail dkim s1 s2 smtp mandrill mailo everlytickey1 protonmail protonmail2 fm1 mxvault"
+
+# ============================================================== 1. finding store
+F_SEV=(); F_CHECK=(); F_RESULT=(); F_WHY=()
+
+reset_findings() { F_SEV=(); F_CHECK=(); F_RESULT=(); F_WHY=(); }
+
+# Strip control characters (incl. ESC) from anything that may echo remote data,
+# so a hostile header cannot inject terminal escape sequences into the report.
+sanitize() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177'; }
+
+add_finding() {  # severity check result why
+  F_SEV+=("$1")
+  F_CHECK+=("$2")
+  F_RESULT+=("$(sanitize "$3")")
+  F_WHY+=("$(sanitize "$4")")
+}
+crit() { add_finding CRITICAL "$@"; }
+warn() { add_finding WARNING  "$@"; }
+ok()   { add_finding OK       "$@"; }
+info() { add_finding INFO     "$@"; }
+
+count_severity() {  # severity -> count
+  local sev="$1" n=0 s
+  for s in "${F_SEV[@]+"${F_SEV[@]}"}"; do [[ "$s" == "$sev" ]] && n=$((n + 1)); done
+  echo "$n"
+}
+
+# ============================================================== 2. pure helpers
+penalty_for() {  # severity -> points deducted
+  case "$1" in
+    CRITICAL) echo "$PENALTY_CRITICAL" ;;
+    WARNING)  echo "$PENALTY_WARNING" ;;
+    *)        echo 0 ;;
+  esac
+}
+
+compute_score() {  # critical_count warning_count -> score 0..100
+  local s=$((100 - $1 * PENALTY_CRITICAL - $2 * PENALTY_WARNING))
+  ((s < 0)) && s=0
+  echo "$s"
+}
+
+grade_for_score() {  # score -> letter
+  local s="$1"
+  if   ((s >= 90)); then echo A
+  elif ((s >= 75)); then echo B
+  elif ((s >= 60)); then echo C
+  elif ((s >= 40)); then echo D
+  else                   echo F
+  fi
+}
+
+# Accepts "example.com", "https://www.Example.com/", "example.com." and returns
+# the bare lower-case host. Returns non-zero (with a reason on stderr) for
+# anything else: paths, query strings, ports, credentials, IPs, metacharacters.
+normalize_domain() {
+  local d="$1"
+  d="${d#http://}"; d="${d#https://}"; d="${d#HTTP://}"; d="${d#HTTPS://}"
+  d="${d%/}"
+  if [[ "$d" == */* || "$d" == *\?* || "$d" == *\#* ]]; then
+    echo "expected a bare domain, not a URL with a path or query: $1" >&2; return 1
+  fi
+  if [[ "$d" == *@* || "$d" == *:* ]]; then
+    echo "credentials and ports are not supported: $1" >&2; return 1
+  fi
+  d="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+  d="${d%.}"
+  d="${d#www.}"
+  if [[ "$d" =~ ^[0-9.]+$ ]]; then
+    echo "an IP address was given; site-audit needs a domain name: $1" >&2; return 1
+  fi
+  if ! is_valid_domain "$d"; then
+    echo "not a valid domain name (use punycode for IDNs): $1" >&2; return 1
+  fi
+  echo "$d"
+}
+
+is_valid_domain() {  # RFC 1123 host name with at least two labels and an alpha TLD
+  local d="$1" LC_ALL=C   # C locale: [a-z] must not match accented letters
+  ((${#d} >= 4 && ${#d} <= 253)) || return 1
+  local label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+  [[ "$d" =~ ^(${label}\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$ ]]
+}
+
+# --- email authentication -------------------------------------------------
+# Input: raw `dig +short TXT` output (one quoted record per line, possibly split
+# into several quoted chunks). Output: one unquoted record per line.
+unquote_txt() { sed -e 's/" "//g' -e 's/"//g'; }
+
+spf_records() { unquote_txt | { command grep -iE '^v=spf1( |$)' || true; }; }
+
+# SPF record -> strict | soft | neutral | pass-all | none
+spf_all_qualifier() {
+  local rec=" $1 "
+  case "$rec" in
+    *" -all "*) echo strict ;;
+    *" ~all "*) echo soft ;;
+    *" ?all "*) echo neutral ;;
+    *" +all "*|*" all "*) echo pass-all ;;
+    *) echo none ;;
+  esac
+}
+
+dmarc_record() { unquote_txt | { command grep -iE '^v=DMARC1' || true; } | sed -n 1p; }
+
+# dmarc_tag RECORD TAG -> value (tags are parsed properly, so "sp=" never
+# shadows "p=").
+dmarc_tag() {
+  local rec="$1" want="$2" part key parts=()
+  IFS=';' read -r -a parts <<<"$rec"
+  for part in "${parts[@]+"${parts[@]}"}"; do
+    part="${part#"${part%%[![:space:]]*}"}"; part="${part%"${part##*[![:space:]]}"}"
+    key="$(printf '%s' "${part%%=*}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$key" == "$want" && "$part" == *=* ]]; then
+      printf '%s\n' "${part#*=}" | tr '[:upper:]' '[:lower:]'
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Unquoted DKIM TXT on stdin -> active | revoked | none. An empty "p=" is a
+# revoked/null key: it tells receivers this selector never signs mail.
+dkim_key_state() {
+  local txt; txt="$(cat)"
+  if   text_has "$txt" 'p=[A-Za-z0-9+/]{40,}';            then echo active
+  elif text_has "$txt" '(v=DKIM1|k=rsa|k=ed25519).*p=( *;|[[:space:]]*$)'; then echo revoked
+  else echo none
+  fi
+}
+
+# MX output -> "null" (RFC 7505 "0 ."), or the number of records.
+mx_summary() {
+  local mx="$1"
+  if [[ -z "$mx" ]]; then echo 0; return; fi
+  if [[ "$(printf '%s\n' "$mx" | sed '/^$/d' | tr -s ' ')" == "0 ." ]]; then echo null; return; fi
+  printf '%s\n' "$mx" | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+# --- HTTP --------------------------------------------------------------------
+# header_get HEADERS NAME -> first value (case-insensitive), CRs removed.
+header_get() {
+  printf '%s\n' "$1" | tr -d '\r' \
+    | { command grep -i "^$2:" || true; } | sed -n 1p | cut -d: -f2- | sed 's/^[[:space:]]*//'
+}
+
+# Only keep the last response block when curl followed redirects / 100-continue.
+last_header_block() { tr -d '\r' | awk '/^HTTP\//{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}'; }
+
+text_has() { printf '%s\n' "$1" | command grep -E "$2" >/dev/null; }  # text regex (no -q: SIGPIPE-safe)
+
+detect_cdn() {  # headers -> CDN name or empty
+  local h server
+  h="$(printf '%s' "$1" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+  server="$(header_get "$h" server)"
+  case "$server" in
+    *cloudflare*) echo Cloudflare; return ;;
+    *akamai*)     echo Akamai; return ;;
+    *vercel*)     echo Vercel; return ;;
+    *netlify*)    echo Netlify; return ;;
+    *cloudfront*) echo CloudFront; return ;;
+  esac
+  if   text_has "$h" '^cf-ray:';              then echo Cloudflare
+  elif text_has "$h" '^x-amz-cf-id:';         then echo CloudFront
+  elif text_has "$h" '^x-fastly-request-id:|^x-served-by: *cache-'; then echo Fastly
+  elif text_has "$h" '^x-vercel-id:';         then echo Vercel
+  elif text_has "$h" '^x-nf-request-id:';     then echo Netlify
+  elif text_has "$h" '^x-akamai-';            then echo Akamai
+  fi
+}
+
+has_version_number() { [[ "$1" =~ [0-9]+\.[0-9]+ ]]; }
+
+# Set-Cookie lines -> "total without_secure without_httponly". Attributes are
+# matched as attributes, so a cookie *named* "secure_id" does not count.
+cookie_flag_counts() {
+  local total=0 nosec=0 noho=0 line lc
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    lc="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
+    [[ "$lc" == set-cookie:* ]] || continue
+    total=$((total + 1))
+    [[ "$lc" =~ \;[[:space:]]*secure[[:space:]]*(\;|$) ]]   || nosec=$((nosec + 1))
+    [[ "$lc" =~ \;[[:space:]]*httponly[[:space:]]*(\;|$) ]] || noho=$((noho + 1))
+  done < <(printf '%s\n' "$1" | tr -d '\r')
+  echo "$total $nosec $noho"
+}
+
+is_int_between() {  # value min max
+  [[ "$1" =~ ^[0-9]{1,6}$ ]] || return 1
+  ((10#$1 >= $2 && 10#$1 <= $3))
+}
+
+is_redirect_code() { [[ "$1" =~ ^30[1278]$ ]]; }
+
+# --- TLS -----------------------------------------------------------------------
+# openssl x509 -issuer line -> organisation (or CN when no O=)
+parse_cert_issuer() {
+  local line="${1#issuer=}" org
+  org="$(printf '%s' "$line" | sed -n 's/.*[ ,]*O *= *\([^,]*\).*/\1/p' | sed -n 1p)"
+  if [[ -z "$org" ]]; then
+    org="$(printf '%s' "$line" | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | sed -n 1p)"
+  fi
+  printf '%s\n' "${org:-unknown issuer}"
+}
+
+to_epoch() {  # "Oct 27 22:17:21 2026 GMT" -> epoch seconds (GNU or BSD date)
+  date -u -d "$1" +%s 2>/dev/null \
+    || date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null
+}
+
+days_until() {  # notAfter [now_epoch] -> whole days (negative when past)
+  local end now
+  end="$(to_epoch "$1")" || return 1
+  now="${2:-$(date -u +%s)}"
+  echo $(((end - now) / 86400))
+}
+
+# --- exposed-file signatures ---------------------------------------------------
+# A path is only reported when the body actually looks like that file. This
+# avoids the classic false positive of "catch-all" sites that answer 200 with
+# the home page for every URL.
+looks_like_html() { head -c 2048 "$1" | tr '[:upper:]' '[:lower:]' | command grep -E '<!doctype html|<html|<head|<body' >/dev/null; }
+
+body_matches_signature() {  # path bodyfile
+  local path="$1" f="$2"
+  [[ -s "$f" ]] || return 1
+  case "$path" in
+    .env)                  ! looks_like_html "$f" && command grep -qE '^[A-Z][A-Z0-9_]*=' "$f" ;;
+    .git/config)           command grep -q '^\[core\]' "$f" ;;
+    .git/HEAD)             command grep -qE '^(ref: refs/|[0-9a-f]{40}$)' "$f" ;;
+    *.zip)                 [[ "$(head -c 2 "$f")" == "PK" ]] ;;
+    *.sql)                 ! looks_like_html "$f" && command grep -qiE 'create table|insert into|dump' "$f" ;;
+    *.bak)                 command grep -q '<?php' "$f" ;;
+    .htpasswd)             ! looks_like_html "$f" && command grep -qE '^[^:[:space:]]+:\$?[[:graph:]]{6,}' "$f" ;;
+    server-status)         command grep -qi 'server status' "$f" ;;
+    phpinfo.php|info.php)  command grep -qiE 'phpinfo\(\)|php version' "$f" ;;
+    .DS_Store)             command grep -q 'Bud1' "$f" ;;
+    composer.json|package.json) ! looks_like_html "$f" && [[ "$(head -c 1 "$f")" == "{" ]] ;;
+    .well-known/security.txt)   ! looks_like_html "$f" && command grep -qi '^contact:' "$f" ;;
+    xmlrpc.php)            command grep -q 'methodResponse' "$f" ;;
+    *)                     command grep -qiE 'type=["'\'']?password|phpmyadmin|adminer' "$f" ;;  # login pages
+  esac
+}
+
+port_name() {
+  case "$1" in
+    21) echo FTP ;; 22) echo SSH ;; 23) echo Telnet ;; 25) echo SMTP ;; 110) echo POP3 ;;
+    143) echo IMAP ;; 465) echo SMTPS ;; 587) echo Submission ;; 993) echo IMAPS ;; 995) echo POP3S ;;
+    2082) echo cPanel ;; 2083) echo cPanel-SSL ;; 2086) echo WHM ;; 2087) echo WHM-SSL ;;
+    3306) echo MySQL ;; 5432) echo PostgreSQL ;; 6379) echo Redis ;; 7080) echo LiteSpeed-admin ;;
+    8080) echo Alt-HTTP ;; 8090) echo Web-panel ;; 8443) echo Plesk ;; 8888) echo Alt-admin ;;
+    9090) echo Cockpit ;; 10000) echo Webmin ;; 27017) echo MongoDB ;; *) echo unknown ;;
+  esac
+}
+
+is_risky_port() { [[ "$RISKY_PORTS" == *" $1 "* ]]; }
+
+json_escape() {  # string -> JSON string body (without surrounding quotes)
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037'
+}
+
+# ============================================================== 3. CLI
+usage() {
+  cat <<'EOF'
+Usage: site-audit <domain> [options]
+
+External, non-intrusive security checkup: DNS/email authentication, HTTPS and
+certificate, security headers, cookies, exposed files, admin paths, open ports.
+
+Options:
+  --md FILE          Also write a markdown report to FILE ("-" = stdout only)
+  --json             Print JSON to stdout instead of the terminal report
+  --fail-under N     Exit 1 when the score is below N (0-100); for CI / cron
+  --no-ports         Skip TCP port probing
+  --timeout SEC      Per-request timeout in seconds (default 12)
+  --color / --no-color
+                     Force or disable ANSI colours (default: auto, honours NO_COLOR)
+  -h, --help         Show this help
+  -V, --version      Show version
+
+Exit codes:
+  0  audit completed (and score >= --fail-under)
+  1  score below --fail-under
+  2  usage error / invalid domain
+  3  missing dependency
+  4  domain does not resolve
+
+Only scan domains you own or are explicitly authorised to test.
+EOF
+}
+
+die_usage() { echo "site-audit: $*" >&2; echo "Try 'site-audit --help'." >&2; exit "$EXIT_USAGE"; }
+
+parse_args() {
+  DOMAIN=""; OPT_MD=""; OPT_JSON=0; OPT_FAIL_UNDER=""; OPT_PORTS=1; OPT_TIMEOUT=12; OPT_COLOR=auto
+  while (($#)); do
+    case "$1" in
+      -h|--help)    usage; exit "$EXIT_OK" ;;
+      -V|--version) echo "site-audit $SITE_AUDIT_VERSION"; exit "$EXIT_OK" ;;
+      --md)         (($# >= 2)) || die_usage "--md needs a file name"; OPT_MD="$2"; shift ;;
+      --md=*)       OPT_MD="${1#*=}" ;;
+      --json)       OPT_JSON=1 ;;
+      --fail-under) (($# >= 2)) || die_usage "--fail-under needs a number"; OPT_FAIL_UNDER="$2"; shift ;;
+      --fail-under=*) OPT_FAIL_UNDER="${1#*=}" ;;
+      --no-ports)   OPT_PORTS=0 ;;
+      --timeout)    (($# >= 2)) || die_usage "--timeout needs a number"; OPT_TIMEOUT="$2"; shift ;;
+      --timeout=*)  OPT_TIMEOUT="${1#*=}" ;;
+      --color)      OPT_COLOR=always ;;
+      --no-color)   OPT_COLOR=never ;;
+      --)           shift; break ;;
+      -*)           die_usage "unknown option: $1" ;;
+      *)            [[ -z "$DOMAIN" ]] || die_usage "only one domain per run (got '$DOMAIN' and '$1')"; DOMAIN="$1" ;;
+    esac
+    shift
+  done
+  if (($#)); then [[ -z "$DOMAIN" ]] || die_usage "only one domain per run"; DOMAIN="$1"; fi
+  [[ -n "$DOMAIN" ]] || { usage >&2; exit "$EXIT_USAGE"; }
+  return 0
+}
+
+validate_args() {
+  DOMAIN="$(normalize_domain "$DOMAIN")" || exit "$EXIT_USAGE"
+  if [[ -n "$OPT_FAIL_UNDER" ]]; then
+    is_int_between "$OPT_FAIL_UNDER" 0 100 || die_usage "--fail-under must be an integer 0-100"
+    OPT_FAIL_UNDER=$((10#$OPT_FAIL_UNDER))
+  fi
+  is_int_between "$OPT_TIMEOUT" 1 120 || die_usage "--timeout must be 1-120 seconds"
+  OPT_TIMEOUT=$((10#$OPT_TIMEOUT))
+  if [[ -n "$OPT_MD" && "$OPT_MD" != "-" ]]; then
+    : 2>/dev/null >"$OPT_MD" || die_usage "cannot write markdown report to: $OPT_MD"
+  fi
+  if ((OPT_JSON)) && [[ "$OPT_MD" == "-" ]]; then die_usage "--json and --md - both want stdout"; fi
+  return 0
+}
+
+check_deps() {
+  local missing=() cmd
+  for cmd in dig curl openssl timeout awk sed tr date mktemp; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  ((${#missing[@]} == 0)) && return 0
+  {
+    echo "site-audit: missing required command(s): ${missing[*]}"
+    echo "  Debian/Ubuntu: sudo apt-get install dnsutils curl openssl coreutils"
+    echo "  RHEL/Fedora:   sudo dnf install bind-utils curl openssl coreutils"
+    echo "  macOS:         brew install bind curl openssl coreutils"
+  } >&2
+  exit "$EXIT_MISSING_DEPS"
+}
+
+# ============================================================== 4. network layer
+# Every function that touches the network lives here, so tests can replace
+# them with fixture readers.
+TMPDIR_AUDIT=""
+
+curl_base() { curl -s -k --max-time "$OPT_TIMEOUT" -A "site-audit/$SITE_AUDIT_VERSION" "$@"; }
+
+dns_query() {  # type name
+  dig +short +time=3 +tries=2 "$1" "$2" 2>/dev/null || true
+}
+
+http_code() {  # url [extra curl args...] -> status code, 000 when unreachable
+  local url="$1"; shift
+  curl_base -o /dev/null -w '%{http_code}' "$@" "$url" 2>/dev/null || true
+}
+
+http_headers() {  # url -> headers of a GET request (not HEAD: some servers differ)
+  curl_base -D - -o /dev/null "$1" 2>/dev/null | last_header_block || true
+}
+
+http_redirect_location() {  # url -> Location header, empty when none
+  header_get "$(http_headers "$1")" location
+}
+
+http_body_to() {  # url outfile max_bytes -> status code; body (first bytes) in outfile
+  curl_base -r "0-$(($3 - 1))" --max-filesize 10485760 -o "$2" -w '%{http_code}' "$1" 2>/dev/null || true
+}
+
+http_post_body_to() {  # url outfile -> status code
+  curl_base -X POST -H 'Content-Type: text/xml' --data '' -o "$2" -w '%{http_code}' "$1" 2>/dev/null || true
+}
+
+tls_verify_result() {  # url -> 0 when the certificate chain and name verify
+  curl -s --max-time "$OPT_TIMEOUT" -o /dev/null -w '%{ssl_verify_result}' "$1" 2>/dev/null || true
+}
+
+tls_cert_info() {  # domain -> "notAfter=..." and "issuer=..." lines
+  { echo | timeout "$OPT_TIMEOUT" openssl s_client -servername "$1" -connect "$1:443" 2>/dev/null \
+      | openssl x509 -noout -enddate -issuer 2>/dev/null; } || true
+}
+
+probe_port() {  # ip port -> exit 0 when a TCP connect succeeds within 3s
+  # shellcheck disable=SC2016  # $1/$2 are expanded by the inner bash, on purpose
+  timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
+}
+
+local_addresses() { hostname -I 2>/dev/null || true; }
+
+# ============================================================== 5. checks
+check_dns() {  # sets A_RECORD (empty when the domain does not resolve)
+  A_RECORD="$(dns_query A "$DOMAIN" | { command grep -E '^[0-9]+(\.[0-9]+){3}$' || true; } | sed -n 1p)"
+  if [[ -z "$A_RECORD" ]]; then
+    crit "Domain resolves" "no A record" "The domain does not point anywhere. Nothing else can be checked."
+    return 0
+  fi
+  ok "Domain resolves" "$A_RECORD" "The site has an address on the internet."
+
+  local mx; mx="$(mx_summary "$(dns_query MX "$DOMAIN")")"
+  case "$mx" in
+    null) info "Email (MX) configured" "null MX (accepts no mail)" "The domain explicitly says it never receives email. Spoofing protection below still matters for SENDING." ;;
+    0)    info "Email (MX) configured" "none" "This domain does not receive email. Spoofing checks below still matter for SENDING." ;;
+    *)    ok   "Email (MX) configured" "$mx record(s)" "The domain can receive email." ;;
+  esac
+}
+
+check_spf() {
+  local recs count rec
+  recs="$(dns_query TXT "$DOMAIN" | spf_records)"
+  count="$(printf '%s\n' "$recs" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if ((count == 0)); then
+    crit "SPF record" "missing" "Anyone can send email that looks like it comes from @$DOMAIN. Receivers have no way to tell it is fake."
+    return
+  fi
+  if ((count > 1)); then
+    warn "SPF record" "$count SPF records published" "Receivers treat multiple SPF records as an error (RFC 7208), so none of them is applied. Merge into one."
+    return
+  fi
+  rec="$(printf '%s\n' "$recs" | sed -n 1p)"
+  case "$(spf_all_qualifier "$rec")" in
+    strict)   ok   "SPF record" "present, strict (-all)" "Receivers are told to reject mail from unlisted servers." ;;
+    soft)     ok   "SPF record" "present, soft (~all)" "Receivers are told to be suspicious of unlisted servers. Fine; -all is stricter." ;;
+    neutral)  warn "SPF record" "present, neutral (?all)" "The record lists servers but tells receivers not to act on fakes." ;;
+    pass-all) crit "SPF record" "allows every server (+all)" "The record explicitly authorises the whole internet to send as @$DOMAIN." ;;
+    *)        warn "SPF record" "present but no -all/~all" "The record exists but does not tell receivers what to do with fakes." ;;
+  esac
+}
+
+check_dkim() {
+  local s state found="" revoked=0
+  for s in $DKIM_SELECTORS; do
+    state="$(dns_query TXT "$s._domainkey.$DOMAIN" | unquote_txt | dkim_key_state)"
+    case "$state" in
+      active)  found="$s"; break ;;
+      revoked) revoked=1 ;;
+    esac
+  done
+  if [[ -n "$found" ]]; then
+    ok "DKIM signing key" "found (selector: $found)" "Outgoing mail can be cryptographically verified as really from this domain."
+  elif ((revoked)); then
+    info "DKIM signing key" "only empty/revoked keys (p=)" "An empty key tells receivers this domain does not sign mail. Correct for a domain that sends no email; a problem if it does."
+  else
+    warn "DKIM signing key" "none found on common selectors" "Mail may still work, but receivers cannot verify it is genuine. Hurts deliverability and lets spoofs through. (Custom selector names cannot be discovered from outside.)"
+  fi
+}
+
+check_dmarc() {
+  local rec p
+  rec="$(dns_query TXT "_dmarc.$DOMAIN" | dmarc_record)"
+  if [[ -z "$rec" ]]; then
+    crit "DMARC policy" "missing" "Nothing tells receivers what to do when a spoofed @$DOMAIN email arrives. Most spoofs will land in the inbox."
+    return
+  fi
+  p="$(dmarc_tag "$rec" p)"
+  case "$p" in
+    reject)     ok   "DMARC policy" "p=reject" "Spoofed mail is thrown away. Strongest setting." ;;
+    quarantine) ok   "DMARC policy" "p=quarantine" "Spoofed mail goes to spam. Good." ;;
+    none)       warn "DMARC policy" "p=none (monitor only)" "You get reports, but spoofed mail is still delivered. Move to quarantine when reports look clean." ;;
+    *)          warn "DMARC policy" "present, policy unclear (${p:-no p= tag})" "Record exists but the policy value is missing or unusual." ;;
+  esac
+  if [[ -z "$(dmarc_tag "$rec" rua)" ]]; then
+    warn "DMARC reporting" "no rua= address" "Without a report address you never learn who is spoofing you."
+  fi
+}
+
+check_https() {  # sets HTTPS_CODE
+  local http_code_ loc
+  HTTPS_CODE="$(http_code "https://$DOMAIN/")"
+  if [[ "$HTTPS_CODE" == "000" ]]; then
+    crit "HTTPS available" "site does not answer on https" "Everything visitors type - passwords, forms, card details - travels unencrypted."
+    return
+  fi
+  ok "HTTPS available" "https answers ($HTTPS_CODE)" "Encrypted connection is offered."
+
+  http_code_="$(http_code "http://$DOMAIN/")"
+  if is_redirect_code "$http_code_"; then
+    loc="$(http_redirect_location "http://$DOMAIN/")"
+    if [[ "$(printf '%s' "$loc" | tr '[:upper:]' '[:lower:]')" == https://* ]]; then
+      ok "Forces HTTPS" "http -> $http_code_ -> https" "Visitors who type the address without https are moved to the secure version automatically."
+    else
+      warn "Forces HTTPS" "http redirects, but not to https" "The redirect goes to ${loc:-an empty Location} - still unencrypted."
+    fi
+  else
+    case "$http_code_" in
+      200) crit "Forces HTTPS" "plain http serves the full site" "The unencrypted version works. On public wifi, anyone nearby can read what visitors send - including login cookies." ;;
+      000) info "Forces HTTPS" "port 80 closed" "Plain http is simply off. Fine, if every link people follow already says https." ;;
+      *)   warn "Forces HTTPS" "http returned $http_code_" "Unexpected response on plain http." ;;
+    esac
+  fi
+}
+
+check_certificate() {
+  local cert end issuer days verify
+  cert="$(tls_cert_info "$DOMAIN")"
+  end="$(printf '%s\n' "$cert" | sed -n 's/^notAfter=//p' | sed -n 1p)"
+  issuer="$(parse_cert_issuer "$(printf '%s\n' "$cert" | command grep '^issuer' | sed -n 1p || true)")"
+  if [[ -n "$end" ]] && days="$(days_until "$end")"; then
+    if   ((days < 0));  then crit "Certificate valid" "EXPIRED $((-days)) days ago" "Browsers show a full-page warning. Visitors leave."
+    elif ((days < 14)); then warn "Certificate valid" "expires in $days days ($issuer)" "Renew soon or the site starts showing warnings."
+    else                     ok   "Certificate valid" "$days days left ($issuer)" "Certificate is healthy."
+    fi
+  else
+    warn "Certificate valid" "could not read certificate" "TLS handshake failed or certificate is malformed."
+  fi
+
+  verify="$(tls_verify_result "https://$DOMAIN/")"
+  if [[ "$verify" == "0" ]]; then
+    ok "Certificate trusted" "chain and name verify" "Browsers trust this certificate."
+  else
+    crit "Certificate trusted" "verify result ${verify:-unknown}" "Browsers will not trust this certificate (self-signed, wrong name, or broken chain)."
+  fi
+}
+
+analyze_headers() {  # headers
+  local h="$1" hsts xfo csp xcto rp srv xpb counts total nosec noho
+  hsts="$(header_get "$h" strict-transport-security)"
+  if [[ -n "$hsts" ]]; then ok "HSTS header" "$hsts" "Browsers remember to always use https for this site."
+  else warn "HSTS header" "missing" "A visitor's first request can be downgraded to http by an attacker on the same network."; fi
+
+  xfo="$(header_get "$h" x-frame-options)"; csp="$(header_get "$h" content-security-policy)"
+  if [[ -n "$xfo" ]] || [[ "$(printf '%s' "$csp" | tr '[:upper:]' '[:lower:]')" == *frame-ancestors* ]]; then
+    ok "Clickjacking protection" "${xfo:-via CSP frame-ancestors}" "Other sites cannot secretly embed this site inside theirs to trick clicks."
+  else
+    warn "Clickjacking protection" "no X-Frame-Options / frame-ancestors" "Another site can load this one in an invisible frame and hijack clicks."
+  fi
+
+  xcto="$(header_get "$h" x-content-type-options)"
+  if [[ -n "$xcto" ]]; then ok "MIME sniffing blocked" "$xcto" "Browsers will not guess file types, which closes a class of script-injection tricks."
+  else warn "MIME sniffing blocked" "missing X-Content-Type-Options" "Browsers may execute a file as script even when it is not meant to be."; fi
+
+  if [[ -n "$csp" ]]; then ok "Content-Security-Policy" "present" "Limits where scripts and content may load from. Strong defence against injected code."
+  else warn "Content-Security-Policy" "missing" "No allow-list for scripts. Any injected script runs. Common gap, worth fixing on sites that take payments or logins."; fi
+
+  rp="$(header_get "$h" referrer-policy)"
+  if [[ -n "$rp" ]]; then ok "Referrer-Policy" "$rp" "Controls what the browser tells other sites about where a visitor came from."
+  else info "Referrer-Policy" "missing" "Minor. Other sites can see the full URL a visitor came from."; fi
+
+  srv="$(header_get "$h" server)"; xpb="$(header_get "$h" x-powered-by)"
+  if has_version_number "$srv $xpb"; then
+    warn "Software version hidden" "leaks: ${srv:+Server: $srv }${xpb:+X-Powered-By: $xpb}" "Telling attackers the exact version lets them look up known holes for it."
+  else
+    ok "Software version hidden" "${srv:-no Server header}" "Attackers are not told which software or version is running."
+  fi
+
+  counts="$(cookie_flag_counts "$h")"
+  read -r total nosec noho <<<"$counts"
+  if ((total > 0)); then
+    if ((nosec > 0)); then warn "Cookies marked Secure" "$nosec of $total cookie(s) without Secure" "Those cookies will also be sent over plain http, where they can be stolen."
+    else ok "Cookies marked Secure" "all $total Secure" "Cookies only travel encrypted."; fi
+    if ((noho > 0)); then warn "Cookies marked HttpOnly" "$noho of $total cookie(s) without HttpOnly" "Injected scripts could read those cookies and take over the session."
+    else ok "Cookies marked HttpOnly" "all $total HttpOnly" "Page scripts cannot read session cookies."; fi
+  fi
+}
+
+check_headers() {  # sets HEADERS
+  HEADERS="$(http_headers "https://$DOMAIN/")"
+  analyze_headers "$HEADERS"
+}
+
+is_self_hosted() {  # ip -> 0 when the target IP belongs to this machine
+  local ip
+  for ip in $(local_addresses); do [[ "$ip" == "$1" ]] && return 0; done
+  return 1
+}
+
+check_ports() {
+  if ((OPT_PORTS == 0)); then
+    info "Open ports" "skipped (--no-ports)" "Port probing was turned off for this run."
+    return
+  fi
+  # A host connecting to its OWN public IP loops back and bypasses its firewall,
+  # so every port looks open. Report that honestly instead of false criticals.
+  if is_self_hosted "$A_RECORD"; then
+    info "Open ports" "not testable - target is this machine" "A server cannot see its own firewall from the inside. Run site-audit from a different machine."
+    return
+  fi
+  # Behind a CDN the IP is the CDN edge, which answers on many ports for every
+  # customer (Cloudflare: 2082/2083/2086/2087/8080/8443). Those are not the
+  # site's own admin panels, so do not report them as such.
+  local cdn; cdn="$(detect_cdn "${HEADERS:-}")"
+  if [[ -n "$cdn" ]]; then
+    info "Open ports" "behind $cdn - origin server is hidden" "Good: attackers cannot reach the server directly either. Ports on this IP belong to $cdn's network, not to this site."
+    return
+  fi
+
+  local p open=() risky=() dir="$TMPDIR_AUDIT/ports"
+  mkdir -p "$dir"
+  for p in $PROBE_PORTS; do   # probe in parallel: worst case ~3s instead of ~75s
+    (probe_port "$A_RECORD" "$p" && : >"$dir/$p") &
+  done
+  wait
+  for p in $PROBE_PORTS; do
+    [[ -e "$dir/$p" ]] || continue
+    open+=("$p/$(port_name "$p")")
+    is_risky_port "$p" && risky+=("$p/$(port_name "$p")")
+  done
+  if ((${#risky[@]} > 0)); then
+    crit "Risky ports open to the internet" "${risky[*]}" "Databases, FTP and admin panels should never be reachable by the whole internet. Each one is a login prompt for attackers to hammer."
+  else
+    ok "Risky ports open to the internet" "none of the common ones" "Databases and admin panels are not exposed."
+  fi
+  if ((${#open[@]} > 0)); then
+    info "All open ports found" "${open[*]}" "For reference. Mail and SSH ports are normal on a server that sends mail or is managed remotely."
+  fi
+}
+
+check_exposed_files() {
+  local path code body exposed=() panels=() n=0
+  local files=".env .git/config .git/HEAD wp-config.php.bak config.php.bak backup.zip backup.sql database.sql .htpasswd server-status phpinfo.php info.php .DS_Store composer.json package.json .well-known/security.txt"
+  for path in $files; do
+    n=$((n + 1)); body="$TMPDIR_AUDIT/file.$n"
+    code="$(http_body_to "https://$DOMAIN/$path" "$body" 4096)"
+    [[ "$code" == 200 || "$code" == 206 ]] || continue
+    body_matches_signature "$path" "$body" || continue
+    case "$path" in
+      .well-known/security.txt) ok "security.txt published" "present" "Security researchers know how to report a hole responsibly." ;;
+      composer.json|package.json) exposed+=("$path (reveals dependency list)") ;;
+      *) exposed+=("$path") ;;
+    esac
+  done
+  if ((${#exposed[@]} > 0)); then
+    crit "Sensitive files exposed" "${exposed[*]}" "These files often contain passwords, keys, or the full list of software in use. They should return 403 or 404."
+  else
+    ok "Sensitive files exposed" "none of the common ones" "Config, backup and source-control files are not downloadable."
+  fi
+
+  for path in wp-login.php wp-admin/ admin/ administrator/ phpmyadmin/ pma/ adminer.php cpanel login; do
+    n=$((n + 1)); body="$TMPDIR_AUDIT/file.$n"
+    code="$(http_body_to "https://$DOMAIN/$path" "$body" 65536)"
+    [[ "$code" == 200 || "$code" == 206 ]] || continue
+    body_matches_signature "$path" "$body" && panels+=("/$path")
+  done
+  if ((${#panels[@]} > 0)); then
+    warn "Admin login pages reachable" "${panels[*]}" "Public login pages get brute-forced constantly. Make sure there is a lockout after a few failures, or restrict who can reach them."
+  else
+    ok "Admin login pages reachable" "none at common paths" "No obvious admin door on the front of the site."
+  fi
+
+  body="$TMPDIR_AUDIT/xmlrpc"
+  code="$(http_post_body_to "https://$DOMAIN/xmlrpc.php" "$body")"
+  if [[ "$code" == 200 ]] && body_matches_signature xmlrpc.php "$body"; then
+    warn "WordPress xmlrpc.php" "enabled" "A favourite for password-guessing at scale and for amplification attacks. Disable unless something needs it."
+  fi
+}
+
+check_www() {
+  local code; code="$(http_code "https://www.$DOMAIN/" -L)"
+  [[ "$code" == 200 ]] || info "www. version" "returns $code" "Some visitors type www. - make sure it works or redirects."
+}
+
+# Populates findings, SCORE and GRADE. Sets RESOLVED=0 when the domain has no A
+# record. Always returns 0, so errexit stays active inside every check (bash
+# silently disables `set -e` in functions called from `if`, `||` or `&&`).
+run_audit() {
+  reset_findings
+  A_RECORD=""; HTTPS_CODE="000"; HEADERS=""; RESOLVED=1
+  check_dns
+  if [[ -z "$A_RECORD" ]]; then RESOLVED=0; finalize_score; return 0; fi
+  check_spf
+  check_dkim
+  check_dmarc
+  check_https
+  if [[ "$HTTPS_CODE" != "000" ]]; then
+    check_certificate
+    check_headers
+  fi
+  check_ports
+  if [[ "$HTTPS_CODE" != "000" ]]; then
+    check_exposed_files
+    check_www
+  fi
+  finalize_score
+}
+
+finalize_score() {
+  N_CRIT="$(count_severity CRITICAL)"; N_WARN="$(count_severity WARNING)"
+  N_OK="$(count_severity OK)"; N_INFO="$(count_severity INFO)"
+  SCORE="$(compute_score "$N_CRIT" "$N_WARN")"
+  GRADE="$(grade_for_score "$SCORE")"
+}
+
+# ============================================================== 6. rendering
+setup_colors() {
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_YELLOW=""; C_GREEN=""; C_BLUE=""
+  local use=0
+  case "$OPT_COLOR" in
+    always) use=1 ;;
+    never)  use=0 ;;
+    *)      [[ -t 1 && -z "${NO_COLOR:-}" ]] && use=1 ;;
+  esac
+  if ((use)); then
+    C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
+    C_RED=$'\e[31m'; C_YELLOW=$'\e[33m'; C_GREEN=$'\e[32m'; C_BLUE=$'\e[34m'
+  fi
+}
+
+section_title() {
+  case "$1" in
+    CRITICAL) echo "Critical - fix these first" ;;
+    WARNING)  echo "Warnings - should fix" ;;
+    OK)       echo "Passed - already good" ;;
+    INFO)     echo "Info - for reference" ;;
+  esac
+}
+
+grade_color() {
+  case "$1" in A|B) printf '%s' "$C_GREEN" ;; C) printf '%s' "$C_YELLOW" ;; *) printf '%s' "$C_RED" ;; esac
+}
+
+render_terminal() {
+  local line="==============================================================" rule="--------------------------------------------------------------"
+  local sev col tag i
+  echo
+  echo "${C_BOLD}${line}${C_RESET}"
+  echo "${C_BOLD}  Website Security Checkup - $DOMAIN${C_RESET}"
+  echo "  $(date +%Y-%m-%d)   Score: $(grade_color "$GRADE")${C_BOLD}$SCORE/100${C_RESET}   Grade: $(grade_color "$GRADE")${C_BOLD}$GRADE${C_RESET}   ($N_CRIT critical, $N_WARN warnings)"
+  echo "${C_BOLD}${line}${C_RESET}"
+  for sev in CRITICAL WARNING OK INFO; do
+    [[ "$(count_severity "$sev")" -gt 0 ]] || continue
+    case "$sev" in
+      CRITICAL) col="$C_RED";    tag="[CRIT]" ;;
+      WARNING)  col="$C_YELLOW"; tag="[WARN]" ;;
+      OK)       col="$C_GREEN";  tag="[ OK ]" ;;
+      INFO)     col="$C_BLUE";   tag="[INFO]" ;;
+    esac
+    echo
+    echo "${col}${C_BOLD}$(section_title "$sev")${C_RESET}"
+    echo "${C_DIM}${rule}${C_RESET}"
+    for i in "${!F_SEV[@]}"; do
+      [[ "${F_SEV[$i]}" == "$sev" ]] || continue
+      printf '  %s%s%s %-32s %s\n' "$col" "$tag" "$C_RESET" "${F_CHECK[$i]}" "${F_RESULT[$i]}"
+      [[ "$sev" == OK ]] || printf '  %-39s %s-> %s%s\n' "" "$C_DIM" "${F_WHY[$i]}" "$C_RESET"
+    done
+  done
+  echo
+}
+
+render_markdown() {
+  local sev i
+  echo "# Website Security Checkup - $DOMAIN"
+  echo
+  echo "**Date:** $(date +%Y-%m-%d) &nbsp; **Score:** $SCORE/100 &nbsp; **Grade:** $GRADE"
+  echo
+  echo "$N_CRIT critical, $N_WARN warnings. Checked from the outside only - the way an attacker would see it."
+  for sev in CRITICAL WARNING OK INFO; do
+    [[ "$(count_severity "$sev")" -gt 0 ]] || continue
+    echo
+    echo "## $(section_title "$sev")"
+    echo
+    echo "| Check | Result | Why it matters |"
+    echo "|---|---|---|"
+    for i in "${!F_SEV[@]}"; do
+      [[ "${F_SEV[$i]}" == "$sev" ]] || continue
+      printf '| %s | %s | %s |\n' "${F_CHECK[$i]//|/\\|}" "${F_RESULT[$i]//|/\\|}" "${F_WHY[$i]//|/\\|}"
+    done
+  done
+  echo
+  echo "---"
+  echo "_Generated by site-audit $SITE_AUDIT_VERSION. Findings are based on public information only; fixing them needs access to DNS and/or the server._"
+}
+
+render_json() {
+  local i n="${#F_SEV[@]}"
+  printf '{\n'
+  printf '  "tool": "site-audit",\n'
+  printf '  "version": "%s",\n' "$SITE_AUDIT_VERSION"
+  printf '  "domain": "%s",\n' "$(json_escape "$DOMAIN")"
+  printf '  "generated_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '  "score": %d,\n' "$SCORE"
+  printf '  "grade": "%s",\n' "$GRADE"
+  printf '  "summary": {"critical": %d, "warning": %d, "ok": %d, "info": %d},\n' "$N_CRIT" "$N_WARN" "$N_OK" "$N_INFO"
+  printf '  "findings": ['
+  for ((i = 0; i < n; i++)); do
+    ((i > 0)) && printf ','
+    printf '\n    {"severity": "%s", "check": "%s", "result": "%s", "why": "%s", "penalty": %d}' \
+      "${F_SEV[$i]}" "$(json_escape "${F_CHECK[$i]}")" "$(json_escape "${F_RESULT[$i]}")" \
+      "$(json_escape "${F_WHY[$i]}")" "$(penalty_for "${F_SEV[$i]}")"
+  done
+  ((n > 0)) && printf '\n  '
+  printf ']\n}\n'
+}
+
+# ============================================================== main
+cleanup() { [[ -n "$TMPDIR_AUDIT" && -d "$TMPDIR_AUDIT" ]] && rm -rf "$TMPDIR_AUDIT"; return 0; }
+
+main() {
+  parse_args "$@"
+  check_deps
+  validate_args
+  setup_colors
+  TMPDIR_AUDIT="$(mktemp -d "${TMPDIR:-/tmp}/site-audit.XXXXXX")"
+  trap cleanup EXIT
+
+  run_audit
+  if ((RESOLVED == 0)); then
+    if ((OPT_JSON)); then
+      printf '{"tool": "site-audit", "version": "%s", "domain": "%s", "error": "domain does not resolve"}\n' \
+        "$SITE_AUDIT_VERSION" "$(json_escape "$DOMAIN")"
+    fi
+    echo "site-audit: $DOMAIN does not resolve (no A record). Stopping." >&2
+    exit "$EXIT_NO_RESOLVE"
+  fi
+
+  if ((OPT_JSON)); then
+    render_json
+  elif [[ "$OPT_MD" == "-" ]]; then
+    render_markdown
+  else
+    render_terminal
+    if [[ -n "$OPT_MD" ]]; then
+      render_markdown >"$OPT_MD"
+      echo "Saved markdown report: $OPT_MD"
+    fi
+  fi
+
+  if [[ -n "$OPT_FAIL_UNDER" ]] && ((SCORE < OPT_FAIL_UNDER)); then
+    echo "site-audit: score $SCORE is below --fail-under $OPT_FAIL_UNDER" >&2
+    exit "$EXIT_BELOW_THRESHOLD"
+  fi
+  exit "$EXIT_OK"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
+  main "$@"
+fi

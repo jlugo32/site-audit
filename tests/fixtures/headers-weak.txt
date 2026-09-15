@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+Date: Tue, 15 Sep 2026 10:00:00 GMT
+Content-Type: text/html; charset=UTF-8
+Server: Apache/2.4.41 (Ubuntu)
+X-Powered-By: PHP/7.4.3
+Set-Cookie: PHPSESSID=deadbeef; path=/
+Set-Cookie: secure_token=xyz; path=/; HttpOnly
+Set-Cookie: cart=1; path=/; secure

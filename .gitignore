@@ -1,0 +1,10 @@
+# Reports you generate locally (the committed samples live in examples/)
+*.report.md
+reports/
+*.log
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,11 @@
+HTTP/2 200
+date: Tue, 15 Sep 2026 10:00:00 GMT
+content-type: text/html; charset=utf-8
+server: nginx
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+x-frame-options: DENY
+x-content-type-options: nosniff
+content-security-policy: default-src 'self'; frame-ancestors 'none'; img-src 'self' data:
+referrer-policy: strict-origin-when-cross-origin
+set-cookie: session=abc123; Path=/; Secure; HttpOnly; SameSite=Lax
+set-cookie: prefs=dark; Path=/; Secure; HttpOnly

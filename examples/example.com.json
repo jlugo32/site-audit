@@ -1,0 +1,30 @@
+{
+  "tool": "site-audit",
+  "version": "1.0.0",
+  "domain": "example.com",
+  "generated_at": "2026-09-15T10:42:18Z",
+  "score": 60,
+  "grade": "C",
+  "summary": {"critical": 1, "warning": 5, "ok": 9, "info": 4},
+  "findings": [
+    {"severity": "OK", "check": "Domain resolves", "result": "104.20.23.154", "why": "The site has an address on the internet.", "penalty": 0},
+    {"severity": "INFO", "check": "Email (MX) configured", "result": "null MX (accepts no mail)", "why": "The domain explicitly says it never receives email. Spoofing protection below still matters for SENDING.", "penalty": 0},
+    {"severity": "OK", "check": "SPF record", "result": "present, strict (-all)", "why": "Receivers are told to reject mail from unlisted servers.", "penalty": 0},
+    {"severity": "INFO", "check": "DKIM signing key", "result": "only empty/revoked keys (p=)", "why": "An empty key tells receivers this domain does not sign mail. Correct for a domain that sends no email; a problem if it does.", "penalty": 0},
+    {"severity": "OK", "check": "DMARC policy", "result": "p=reject", "why": "Spoofed mail is thrown away. Strongest setting.", "penalty": 0},
+    {"severity": "WARNING", "check": "DMARC reporting", "result": "no rua= address", "why": "Without a report address you never learn who is spoofing you.", "penalty": 5},
+    {"severity": "OK", "check": "HTTPS available", "result": "https answers (200)", "why": "Encrypted connection is offered.", "penalty": 0},
+    {"severity": "CRITICAL", "check": "Forces HTTPS", "result": "plain http serves the full site", "why": "The unencrypted version works. On public wifi, anyone nearby can read what visitors send - including login cookies.", "penalty": 15},
+    {"severity": "OK", "check": "Certificate valid", "result": "42 days left (SSL Corporation)", "why": "Certificate is healthy.", "penalty": 0},
+    {"severity": "OK", "check": "Certificate trusted", "result": "chain and name verify", "why": "Browsers trust this certificate.", "penalty": 0},
+    {"severity": "WARNING", "check": "HSTS header", "result": "missing", "why": "A visitor's first request can be downgraded to http by an attacker on the same network.", "penalty": 5},
+    {"severity": "WARNING", "check": "Clickjacking protection", "result": "no X-Frame-Options / frame-ancestors", "why": "Another site can load this one in an invisible frame and hijack clicks.", "penalty": 5},
+    {"severity": "WARNING", "check": "MIME sniffing blocked", "result": "missing X-Content-Type-Options", "why": "Browsers may execute a file as script even when it is not meant to be.", "penalty": 5},
+    {"severity": "WARNING", "check": "Content-Security-Policy", "result": "missing", "why": "No allow-list for scripts. Any injected script runs. Common gap, worth fixing on sites that take payments or logins.", "penalty": 5},
+    {"severity": "INFO", "check": "Referrer-Policy", "result": "missing", "why": "Minor. Other sites can see the full URL a visitor came from.", "penalty": 0},
+    {"severity": "OK", "check": "Software version hidden", "result": "cloudflare", "why": "Attackers are not told which software or version is running.", "penalty": 0},
+    {"severity": "INFO", "check": "Open ports", "result": "behind Cloudflare - origin server is hidden", "why": "Good: attackers cannot reach the server directly either. Ports on this IP belong to Cloudflare's network, not to this site.", "penalty": 0},
+    {"severity": "OK", "check": "Sensitive files exposed", "result": "none of the common ones", "why": "Config, backup and source-control files are not downloadable.", "penalty": 0},
+    {"severity": "OK", "check": "Admin login pages reachable", "result": "none at common paths", "why": "No obvious admin door on the front of the site.", "penalty": 0}
+  ]
+}

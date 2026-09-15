@@ -1,0 +1,6 @@
+HTTP/2 200
+date: Tue, 15 Sep 2026 10:00:00 GMT
+content-type: text/html
+server: cloudflare
+cf-cache-status: HIT
+cf-ray: 0123456789abcdef-IAD

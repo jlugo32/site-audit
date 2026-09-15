@@ -1,0 +1,2 @@
+"google-site-verification=abcdefghijklmnopqrstuvwxyz0123456789"
+"v=spf1 include:_spf.example.net " "ip4:192.0.2.10 -all"

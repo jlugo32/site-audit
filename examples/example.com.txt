@@ -1,0 +1,48 @@
+
+==============================================================
+  Website Security Checkup - example.com
+  2026-09-15   Score: 60/100   Grade: C   (1 critical, 5 warnings)
+==============================================================
+
+Critical - fix these first
+--------------------------------------------------------------
+  [CRIT] Forces HTTPS                     plain http serves the full site
+                                          -> The unencrypted version works. On public wifi, anyone nearby can read what visitors send - including login cookies.
+
+Warnings - should fix
+--------------------------------------------------------------
+  [WARN] DMARC reporting                  no rua= address
+                                          -> Without a report address you never learn who is spoofing you.
+  [WARN] HSTS header                      missing
+                                          -> A visitor's first request can be downgraded to http by an attacker on the same network.
+  [WARN] Clickjacking protection          no X-Frame-Options / frame-ancestors
+                                          -> Another site can load this one in an invisible frame and hijack clicks.
+  [WARN] MIME sniffing blocked            missing X-Content-Type-Options
+                                          -> Browsers may execute a file as script even when it is not meant to be.
+  [WARN] Content-Security-Policy          missing
+                                          -> No allow-list for scripts. Any injected script runs. Common gap, worth fixing on sites that take payments or logins.
+
+Passed - already good
+--------------------------------------------------------------
+  [ OK ] Domain resolves                  104.20.23.154
+  [ OK ] SPF record                       present, strict (-all)
+  [ OK ] DMARC policy                     p=reject
+  [ OK ] HTTPS available                  https answers (200)
+  [ OK ] Certificate valid                42 days left (SSL Corporation)
+  [ OK ] Certificate trusted              chain and name verify
+  [ OK ] Software version hidden          cloudflare
+  [ OK ] Sensitive files exposed          none of the common ones
+  [ OK ] Admin login pages reachable      none at common paths
+
+Info - for reference
+--------------------------------------------------------------
+  [INFO] Email (MX) configured            null MX (accepts no mail)
+                                          -> The domain explicitly says it never receives email. Spoofing protection below still matters for SENDING.
+  [INFO] DKIM signing key                 only empty/revoked keys (p=)
+                                          -> An empty key tells receivers this domain does not sign mail. Correct for a domain that sends no email; a problem if it does.
+  [INFO] Referrer-Policy                  missing
+                                          -> Minor. Other sites can see the full URL a visitor came from.
+  [INFO] Open ports                       behind Cloudflare - origin server is hidden
+                                          -> Good: attackers cannot reach the server directly either. Ports on this IP belong to Cloudflare's network, not to this site.
+
+Saved markdown report: examples/example.com.md
