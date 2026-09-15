@@ -20,7 +20,7 @@
 # The file can be sourced without running anything (see the guard at the end),
 # which is how tests/run.sh unit-tests the helpers and replays fixture data.
 
-readonly SITE_AUDIT_VERSION="1.0.0"
+readonly SITE_AUDIT_VERSION="1.1.0"
 
 # Exit codes
 readonly EXIT_OK=0            # audit ran (and score >= --fail-under, if given)
@@ -95,7 +95,8 @@ grade_for_score() {  # score -> letter
 # anything else: paths, query strings, ports, credentials, IPs, metacharacters.
 normalize_domain() {
   local d="$1"
-  d="${d#http://}"; d="${d#https://}"; d="${d#HTTP://}"; d="${d#HTTPS://}"
+  # Strip an http:// or https:// scheme in any letter case (Http://, HTTPS://...).
+  if [[ "$d" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then d="${d#*://}"; fi
   d="${d%/}"
   if [[ "$d" == */* || "$d" == *\?* || "$d" == *\#* ]]; then
     echo "expected a bare domain, not a URL with a path or query: $1" >&2; return 1
@@ -129,14 +130,16 @@ unquote_txt() { sed -e 's/" "//g' -e 's/"//g'; }
 
 spf_records() { unquote_txt | { command grep -iE '^v=spf1( |$)' || true; }; }
 
-# SPF record -> strict | soft | neutral | pass-all | none
+# SPF record -> strict | soft | neutral | pass-all | redirect | none
+# The record is lower-cased first so an uppercase "-ALL" is still recognised.
 spf_all_qualifier() {
-  local rec=" $1 "
+  local rec; rec=" $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') "
   case "$rec" in
     *" -all "*) echo strict ;;
     *" ~all "*) echo soft ;;
     *" ?all "*) echo neutral ;;
     *" +all "*|*" all "*) echo pass-all ;;
+    *redirect=*) echo redirect ;;   # SPF policy delegated to another domain
     *) echo none ;;
   esac
 }
@@ -233,6 +236,14 @@ is_int_between() {  # value min max
 
 is_redirect_code() { [[ "$1" =~ ^30[1278]$ ]]; }
 
+# is_same_site HOST OTHER -> 0 when OTHER is HOST or its www/apex counterpart.
+# Used to decide whether a redirect stayed on the same site before trusting the
+# headers curl landed on.
+is_same_site() {
+  local a="${1#www.}" b="${2#www.}"
+  [[ -n "$a" && "$a" == "$b" ]]
+}
+
 # --- TLS -----------------------------------------------------------------------
 # openssl x509 -issuer line -> organisation (or CN when no O=)
 parse_cert_issuer() {
@@ -244,9 +255,30 @@ parse_cert_issuer() {
   printf '%s\n' "${org:-unknown issuer}"
 }
 
-to_epoch() {  # "Oct 27 22:17:21 2026 GMT" -> epoch seconds (GNU or BSD date)
+to_epoch() {  # "Oct 27 22:17:21 2026 GMT" -> epoch seconds (GNU, BSD or busybox date)
   date -u -d "$1" +%s 2>/dev/null \
-    || date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null
+    || date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null \
+    || epoch_fallback "$1"
+}
+
+# Last-resort parser for systems whose date(1) understands neither the GNU
+# free-form -d string nor the BSD "-j -f" form (busybox/Alpine). It reshapes the
+# OpenSSL notAfter string "Mon DD HH:MM:SS YYYY [TZ]" into an ISO date that even
+# busybox date can convert.
+epoch_fallback() {
+  local mon m day time year
+  # shellcheck disable=SC2086  # deliberate word-splitting of the date string
+  set -- $1
+  mon="${1:-}"; day="${2:-}"; time="${3:-}"; year="${4:-}"
+  case "$mon" in
+    Jan) m=01 ;; Feb) m=02 ;; Mar) m=03 ;; Apr) m=04 ;; May) m=05 ;; Jun) m=06 ;;
+    Jul) m=07 ;; Aug) m=08 ;; Sep) m=09 ;; Oct) m=10 ;; Nov) m=11 ;; Dec) m=12 ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$day" && -n "$time" && "$year" =~ ^[0-9]{4}$ ]] || return 1
+  printf -v day '%02d' "$((10#$day))" 2>/dev/null || return 1
+  date -u -d "$year-$m-$day $time" +%s 2>/dev/null \
+    || date -u -D '%Y-%m-%d %H:%M:%S' -d "$year-$m-$day $time" +%s 2>/dev/null
 }
 
 days_until() {  # notAfter [now_epoch] -> whole days (negative when past)
@@ -254,6 +286,20 @@ days_until() {  # notAfter [now_epoch] -> whole days (negative when past)
   end="$(to_epoch "$1")" || return 1
   now="${2:-$(date -u +%s)}"
   echo $(((end - now) / 86400))
+}
+
+# OpenSSL/curl certificate verify code -> short human-readable reason.
+verify_human() {
+  case "$1" in
+    10)    echo "certificate has expired" ;;
+    9)     echo "certificate is not yet valid" ;;
+    18)    echo "self-signed certificate" ;;
+    19)    echo "self-signed certificate in the chain" ;;
+    20|21) echo "cannot build a trusted chain (untrusted root)" ;;
+    62)    echo "certificate name does not match the host" ;;
+    ""|0)  echo "untrusted" ;;
+    *)     echo "name mismatch or untrusted (verify code $1)" ;;
+  esac
 }
 
 # --- exposed-file signatures ---------------------------------------------------
@@ -296,6 +342,21 @@ port_name() {
 
 is_risky_port() { [[ "$RISKY_PORTS" == *" $1 "* ]]; }
 
+# is_private_ip ADDR -> 0 when the address is loopback, RFC 1918, link-local or
+# IPv6 unique-local/link-local. Probing such an address would scan the local
+# network or this machine, never the real target.
+is_private_ip() {
+  case "$1" in
+    127.*|0.0.0.0|::1)                       return 0 ;;   # loopback / unspecified
+    10.*|192.168.*)                          return 0 ;;   # RFC 1918
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*)   return 0 ;;   # RFC 1918 172.16/12
+    169.254.*)                               return 0 ;;   # IPv4 link-local
+    [Ff][CcDd][0-9A-Fa-f][0-9A-Fa-f]:*|[Ff][CcDd]:*) return 0 ;;  # IPv6 ULA fc00::/7
+    [Ff][Ee]80:*)                            return 0 ;;   # IPv6 link-local
+  esac
+  return 1
+}
+
 json_escape() {  # string -> JSON string body (without surrounding quotes)
   local s="$1"
   s="${s//\\/\\\\}"
@@ -319,7 +380,8 @@ Options:
   --json             Print JSON to stdout instead of the terminal report
   --fail-under N     Exit 1 when the score is below N (0-100); for CI / cron
   --no-ports         Skip TCP port probing
-  --timeout SEC      Per-request timeout in seconds (default 12)
+  --timeout SEC      Per-request timeout in seconds (default 12; applies to each
+                     network request, not to the whole audit)
   --color / --no-color
                      Force or disable ANSI colours (default: auto, honours NO_COLOR)
   -h, --help         Show this help
@@ -345,13 +407,13 @@ parse_args() {
       -h|--help)    usage; exit "$EXIT_OK" ;;
       -V|--version) echo "site-audit $SITE_AUDIT_VERSION"; exit "$EXIT_OK" ;;
       --md)         (($# >= 2)) || die_usage "--md needs a file name"; OPT_MD="$2"; shift ;;
-      --md=*)       OPT_MD="${1#*=}" ;;
+      --md=*)       OPT_MD="${1#*=}"; [[ -n "$OPT_MD" ]] || die_usage "--md needs a file name" ;;
       --json)       OPT_JSON=1 ;;
       --fail-under) (($# >= 2)) || die_usage "--fail-under needs a number"; OPT_FAIL_UNDER="$2"; shift ;;
-      --fail-under=*) OPT_FAIL_UNDER="${1#*=}" ;;
+      --fail-under=*) OPT_FAIL_UNDER="${1#*=}"; [[ -n "$OPT_FAIL_UNDER" ]] || die_usage "--fail-under needs a number" ;;
       --no-ports)   OPT_PORTS=0 ;;
       --timeout)    (($# >= 2)) || die_usage "--timeout needs a number"; OPT_TIMEOUT="$2"; shift ;;
-      --timeout=*)  OPT_TIMEOUT="${1#*=}" ;;
+      --timeout=*)  OPT_TIMEOUT="${1#*=}"; [[ -n "$OPT_TIMEOUT" ]] || die_usage "--timeout needs a number" ;;
       --color)      OPT_COLOR=always ;;
       --no-color)   OPT_COLOR=never ;;
       --)           shift; break ;;
@@ -374,7 +436,15 @@ validate_args() {
   is_int_between "$OPT_TIMEOUT" 1 120 || die_usage "--timeout must be 1-120 seconds"
   OPT_TIMEOUT=$((10#$OPT_TIMEOUT))
   if [[ -n "$OPT_MD" && "$OPT_MD" != "-" ]]; then
-    : 2>/dev/null >"$OPT_MD" || die_usage "cannot write markdown report to: $OPT_MD"
+    # Check writability WITHOUT truncating: an existing file must survive a run
+    # that later aborts, and the markdown is only written after a good audit.
+    local mddir
+    if [[ -e "$OPT_MD" ]]; then
+      [[ -f "$OPT_MD" && -w "$OPT_MD" ]] || die_usage "cannot write markdown report to: $OPT_MD"
+    else
+      mddir="$(dirname -- "$OPT_MD")"
+      [[ -d "$mddir" && -w "$mddir" ]] || die_usage "cannot write markdown report to: $OPT_MD"
+    fi
   fi
   if ((OPT_JSON)) && [[ "$OPT_MD" == "-" ]]; then die_usage "--json and --md - both want stdout"; fi
   return 0
@@ -390,7 +460,9 @@ check_deps() {
     echo "site-audit: missing required command(s): ${missing[*]}"
     echo "  Debian/Ubuntu: sudo apt-get install dnsutils curl openssl coreutils"
     echo "  RHEL/Fedora:   sudo dnf install bind-utils curl openssl coreutils"
-    echo "  macOS:         brew install bind curl openssl coreutils"
+    echo "  macOS:         brew install bash bind curl openssl coreutils"
+    echo "                 (coreutils installs 'timeout' as 'gtimeout'; add its"
+    echo "                  gnubin dir to PATH, e.g. \$(brew --prefix)/opt/coreutils/libexec/gnubin)"
   } >&2
   exit "$EXIT_MISSING_DEPS"
 }
@@ -411,8 +483,26 @@ http_code() {  # url [extra curl args...] -> status code, 000 when unreachable
   curl_base -o /dev/null -w '%{http_code}' "$@" "$url" 2>/dev/null || true
 }
 
-http_headers() {  # url -> headers of a GET request (not HEAD: some servers differ)
+http_headers() {  # url -> headers of a GET request AT this url (no redirect following)
   curl_base -D - -o /dev/null "$1" 2>/dev/null | last_header_block || true
+}
+
+# url -> security headers of the FINAL page, following redirects but only while
+# they stay on the same site (apex<->www, http->https). An apex that 301s to www
+# would otherwise report every security header as missing. If the redirect leaves
+# the site, we fall back to the origin's own (unfollowed) headers so findings are
+# never attributed to some other server.
+http_security_headers() {
+  local url="$1" host out final fhost
+  host="${url#*://}"; host="${host%%/*}"
+  out="$(curl_base -L --max-redirs 5 -D - -o /dev/null -w '\n%{url_effective}' "$url" 2>/dev/null)" || out=""
+  final="$(printf '%s' "$out" | tr -d '\r' | sed -n '$p')"
+  fhost="${final#*://}"; fhost="${fhost%%/*}"
+  if [[ -n "$final" ]] && is_same_site "$host" "$fhost"; then
+    printf '%s\n' "$out" | sed '$d' | last_header_block
+  else
+    http_headers "$url"
+  fi
 }
 
 http_redirect_location() {  # url -> Location header, empty when none
@@ -427,8 +517,18 @@ http_post_body_to() {  # url outfile -> status code
   curl_base -X POST -H 'Content-Type: text/xml' --data '' -o "$2" -w '%{http_code}' "$1" 2>/dev/null || true
 }
 
-tls_verify_result() {  # url -> 0 when the certificate chain and name verify
-  curl -s --max-time "$OPT_TIMEOUT" -o /dev/null -w '%{ssl_verify_result}' "$1" 2>/dev/null || true
+tls_verify_result() {  # url -> "0" trusted | verify code | "unreachable"
+  # %{ssl_verify_result} is 0 both when the chain verifies AND when no TLS
+  # handshake happened at all (timeout/reset), so 0 alone must not be read as
+  # "trusted". Capture the curl exit status and http_code and only trust 0 when
+  # the request actually completed.
+  local out rc verify code
+  out="$(curl -s --max-time "$OPT_TIMEOUT" -o /dev/null -w '%{ssl_verify_result} %{http_code}' "$1" 2>/dev/null)"
+  rc=$?
+  verify="${out%% *}"; code="${out##* }"
+  if [[ -n "$verify" && "$verify" != "0" ]]; then echo "$verify"; return 0; fi
+  if ((rc == 0)) && [[ -n "$code" && "$code" != "000" ]]; then echo 0; return 0; fi
+  echo unreachable
 }
 
 tls_cert_info() {  # domain -> "notAfter=..." and "issuer=..." lines
@@ -441,7 +541,17 @@ probe_port() {  # ip port -> exit 0 when a TCP connect succeeds within 3s
   timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null
 }
 
-local_addresses() { hostname -I 2>/dev/null || true; }
+local_addresses() {  # this machine's own IPs (for the self-host false-positive guard)
+  local ips
+  ips="$(hostname -I 2>/dev/null)" || ips=""          # GNU/Linux
+  if [[ -z "${ips// }" ]]; then                        # busybox/macOS have no -I
+    ips="$(ip -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}')" || ips=""
+  fi
+  if [[ -z "${ips// }" ]]; then
+    ips="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | sed 's/^addr://')" || ips=""
+  fi
+  printf '%s\n' "$ips"
+}
 
 # ============================================================== 5. checks
 check_dns() {  # sets A_RECORD (empty when the domain does not resolve)
@@ -478,6 +588,7 @@ check_spf() {
     soft)     ok   "SPF record" "present, soft (~all)" "Receivers are told to be suspicious of unlisted servers. Fine; -all is stricter." ;;
     neutral)  warn "SPF record" "present, neutral (?all)" "The record lists servers but tells receivers not to act on fakes." ;;
     pass-all) crit "SPF record" "allows every server (+all)" "The record explicitly authorises the whole internet to send as @$DOMAIN." ;;
+    redirect) ok   "SPF record" "present, delegated (redirect=)" "The record delegates its SPF policy to another domain via redirect=. Valid: the target domain's -all/~all qualifier applies." ;;
     *)        warn "SPF record" "present but no -all/~all" "The record exists but does not tell receivers what to do with fakes." ;;
   esac
 }
@@ -514,6 +625,10 @@ check_dmarc() {
     none)       warn "DMARC policy" "p=none (monitor only)" "You get reports, but spoofed mail is still delivered. Move to quarantine when reports look clean." ;;
     *)          warn "DMARC policy" "present, policy unclear (${p:-no p= tag})" "Record exists but the policy value is missing or unusual." ;;
   esac
+  local pct; pct="$(dmarc_tag "$rec" pct)"
+  if [[ "$p" == reject || "$p" == quarantine ]] && is_int_between "$pct" 0 100 && ((10#$pct < 100)); then
+    warn "DMARC coverage" "pct=$pct (policy applied to only $pct% of mail)" "With pct below 100, receivers apply your p=$p policy to just $pct% of failing mail and merely monitor the rest, so most spoofs still get through. Set pct=100 (the default) for full protection."
+  fi
   if [[ -z "$(dmarc_tag "$rec" rua)" ]]; then
     warn "DMARC reporting" "no rua= address" "Without a report address you never learn who is spoofing you."
   fi
@@ -546,12 +661,12 @@ check_https() {  # sets HTTPS_CODE
 }
 
 check_certificate() {
-  local cert end issuer days verify
+  local cert end issuer days verify expired=0
   cert="$(tls_cert_info "$DOMAIN")"
   end="$(printf '%s\n' "$cert" | sed -n 's/^notAfter=//p' | sed -n 1p)"
   issuer="$(parse_cert_issuer "$(printf '%s\n' "$cert" | command grep '^issuer' | sed -n 1p || true)")"
   if [[ -n "$end" ]] && days="$(days_until "$end")"; then
-    if   ((days < 0));  then crit "Certificate valid" "EXPIRED $((-days)) days ago" "Browsers show a full-page warning. Visitors leave."
+    if   ((days < 0));  then crit "Certificate valid" "EXPIRED $((-days)) days ago" "Browsers show a full-page warning. Visitors leave."; expired=1
     elif ((days < 14)); then warn "Certificate valid" "expires in $days days ($issuer)" "Renew soon or the site starts showing warnings."
     else                     ok   "Certificate valid" "$days days left ($issuer)" "Certificate is healthy."
     fi
@@ -562,8 +677,14 @@ check_certificate() {
   verify="$(tls_verify_result "https://$DOMAIN/")"
   if [[ "$verify" == "0" ]]; then
     ok "Certificate trusted" "chain and name verify" "Browsers trust this certificate."
+  elif [[ "$verify" == "unreachable" ]]; then
+    warn "Certificate trusted" "could not verify (no TLS handshake)" "The server did not complete a TLS handshake within the timeout, so its certificate could not be checked. Re-run, or increase --timeout."
+  elif [[ "$verify" == "10" && "$expired" == 1 ]]; then
+    # Already counted as a critical under "Certificate valid"; do not penalise
+    # the same expiry twice.
+    info "Certificate trusted" "verify: certificate has expired" "Same expiry already flagged above under 'Certificate valid'; not double-counted here."
   else
-    crit "Certificate trusted" "verify result ${verify:-unknown}" "Browsers will not trust this certificate (self-signed, wrong name, or broken chain)."
+    crit "Certificate trusted" "$(verify_human "$verify")" "Browsers will not trust this certificate (self-signed, wrong name, or broken chain)."
   fi
 }
 
@@ -609,7 +730,7 @@ analyze_headers() {  # headers
 }
 
 check_headers() {  # sets HEADERS
-  HEADERS="$(http_headers "https://$DOMAIN/")"
+  HEADERS="$(http_security_headers "https://$DOMAIN/")"
   analyze_headers "$HEADERS"
 }
 
@@ -628,6 +749,13 @@ check_ports() {
   # so every port looks open. Report that honestly instead of false criticals.
   if is_self_hosted "$A_RECORD"; then
     info "Open ports" "not testable - target is this machine" "A server cannot see its own firewall from the inside. Run site-audit from a different machine."
+    return
+  fi
+  # A domain pointed at a loopback or RFC 1918 / link-local address would make
+  # the probe scan this machine or the local network, reporting their ports as
+  # the target's. Skip it instead of emitting phantom findings.
+  if is_private_ip "$A_RECORD"; then
+    info "Open ports" "not testable - resolves to a private/loopback address ($A_RECORD)" "The domain points at a non-routable address, so probing it would scan the local network, not the site. Run site-audit where the domain resolves to its public address."
     return
   fi
   # Behind a CDN the IP is the CDN edge, which answers on many ports for every
@@ -680,16 +808,18 @@ check_exposed_files() {
     ok "Sensitive files exposed" "none of the common ones" "Config, backup and source-control files are not downloadable."
   fi
 
-  for path in wp-login.php wp-admin/ admin/ administrator/ phpmyadmin/ pma/ adminer.php cpanel login; do
+  # Only admin-specific paths. A bare /login (or /signin) is usually the normal
+  # customer sign-in page and flagging it is a false positive, so it is omitted.
+  for path in wp-login.php wp-admin/ admin/ admin/login administrator/ phpmyadmin/ pma/ adminer.php cpanel manager/; do
     n=$((n + 1)); body="$TMPDIR_AUDIT/file.$n"
     code="$(http_body_to "https://$DOMAIN/$path" "$body" 65536)"
     [[ "$code" == 200 || "$code" == 206 ]] || continue
     body_matches_signature "$path" "$body" && panels+=("/$path")
   done
   if ((${#panels[@]} > 0)); then
-    warn "Admin login pages reachable" "${panels[*]}" "Public login pages get brute-forced constantly. Make sure there is a lockout after a few failures, or restrict who can reach them."
+    warn "Admin login pages reachable" "${panels[*]}" "Public admin login pages get brute-forced constantly. Make sure there is a lockout after a few failures, or restrict who can reach them."
   else
-    ok "Admin login pages reachable" "none at common paths" "No obvious admin door on the front of the site."
+    ok "Admin login pages reachable" "none at common admin paths" "No obvious admin door on the front of the site."
   fi
 
   body="$TMPDIR_AUDIT/xmlrpc"
@@ -836,6 +966,23 @@ render_json() {
   printf ']\n}\n'
 }
 
+# Write the markdown report to a file atomically: build it in a sibling temp file
+# and rename it into place, so an existing report is only ever replaced by a
+# complete new one. Called at the very end, after a successful audit. The "Saved"
+# confirmation goes to stderr to keep stdout clean for --json.
+write_markdown_file() {  # dest
+  local dest="$1" dir tmp
+  dir="$(dirname -- "$dest")"
+  tmp="$(mktemp "$dir/.site-audit.md.XXXXXX" 2>/dev/null)" || tmp=""
+  if [[ -n "$tmp" ]] && render_markdown >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$dest"
+  else
+    [[ -n "$tmp" ]] && rm -f "$tmp" 2>/dev/null
+    render_markdown >"$dest"   # fallback: no writable temp beside dest
+  fi
+  echo "Saved markdown report: $dest" >&2
+}
+
 # ============================================================== main
 cleanup() { [[ -n "$TMPDIR_AUDIT" && -d "$TMPDIR_AUDIT" ]] && rm -rf "$TMPDIR_AUDIT"; return 0; }
 
@@ -857,16 +1004,18 @@ main() {
     exit "$EXIT_NO_RESOLVE"
   fi
 
+  # stdout gets exactly one of: JSON, markdown (--md -), or the terminal report.
+  # A markdown FILE is written in addition to any of them, so --json --md FILE
+  # produces both. --json + --md - is already rejected in validate_args.
   if ((OPT_JSON)); then
     render_json
   elif [[ "$OPT_MD" == "-" ]]; then
     render_markdown
   else
     render_terminal
-    if [[ -n "$OPT_MD" ]]; then
-      render_markdown >"$OPT_MD"
-      echo "Saved markdown report: $OPT_MD"
-    fi
+  fi
+  if [[ -n "$OPT_MD" && "$OPT_MD" != "-" ]]; then
+    write_markdown_file "$OPT_MD"
   fi
 
   if [[ -n "$OPT_FAIL_UNDER" ]] && ((SCORE < OPT_FAIL_UNDER)); then

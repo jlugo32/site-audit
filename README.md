@@ -43,7 +43,7 @@ language that a non-technical owner can act on.
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-account>/site-audit.git
+git clone https://github.com/jlugo32/site-audit.git
 cd site-audit
 ./site-audit example.com
 ```
@@ -57,6 +57,14 @@ Docker.
 | Debian / Ubuntu | `sudo apt-get install dnsutils curl openssl coreutils` |
 | RHEL / Fedora | `sudo dnf install bind-utils curl openssl coreutils` |
 | macOS (Homebrew) | `brew install bash bind curl openssl coreutils` |
+
+On macOS the default Bash is 3.2, so `brew install bash` (4.4+) is required.
+Homebrew's coreutils installs GNU `timeout` as **`gtimeout`**; add its gnubin
+directory to your `PATH` so `site-audit` finds a `timeout`:
+
+```bash
+export PATH="$(brew --prefix)/opt/coreutils/libexec/gnubin:$PATH"
+```
 
 If anything is missing, the script tells you which command it needs and how to
 install it, then exits with code `3`.
@@ -78,6 +86,8 @@ checks are listed as `OK` and cost nothing.
 | DNS | MX records (detects RFC 7505 null MX) | Info |
 | Email spoofing | SPF record missing, or `+all` (authorises everyone) | Critical |
 | Email spoofing | SPF `?all` / no `all` / multiple SPF records | Warning |
+| Email spoofing | SPF `redirect=` (policy delegated to another domain) | OK |
+| Email spoofing | DMARC `p=reject`/`quarantine` but `pct` below 100 | Warning |
 | Email spoofing | DKIM key on 19 common selectors | Warning (Info if only revoked `p=` keys) |
 | Email spoofing | DMARC record missing | Critical |
 | Email spoofing | DMARC `p=none` or unclear policy | Warning |
@@ -99,7 +109,7 @@ checks are listed as `OK` and cost nothing.
 | Network | Risky ports reachable: FTP, Telnet, MySQL, PostgreSQL, Redis, MongoDB, hosting/admin panels (cPanel, WHM, Plesk, Webmin, Cockpit...) | Critical |
 | Network | All open ports among 25 probed, including SSH and mail | Info |
 | Exposure | `.env`, `.git/`, `*.bak`, `backup.zip`, `*.sql`, `.htpasswd`, `server-status`, `phpinfo`, `.DS_Store`, `composer.json`, `package.json` | Critical |
-| Exposure | Login pages at `wp-login.php`, `wp-admin/`, `admin/`, `phpmyadmin/`, `adminer.php`... | Warning |
+| Exposure | Admin login pages at `wp-login.php`, `wp-admin/`, `admin/`, `administrator/`, `phpmyadmin/`, `adminer.php`, `manager/`... (a bare `/login` customer page is not flagged) | Warning |
 | Exposure | WordPress `xmlrpc.php` enabled | Warning |
 | Hygiene | `www.` version does not work | Info |
 | Bonus | `/.well-known/security.txt` published | OK (no penalty if absent) |
@@ -130,7 +140,8 @@ Options:
   --json             Print JSON to stdout instead of the terminal report
   --fail-under N     Exit 1 when the score is below N (0-100); for CI / cron
   --no-ports         Skip TCP port probing
-  --timeout SEC      Per-request timeout in seconds (default 12)
+  --timeout SEC      Per-request timeout in seconds (default 12; per request,
+                     not a cap on the whole audit)
   --color / --no-color
                      Force or disable ANSI colours (default: auto, honours NO_COLOR)
   -h, --help         Show this help
@@ -216,7 +227,7 @@ cost, so dashboards can explain the score.
 ```json
 {
   "tool": "site-audit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "domain": "example.com",
   "generated_at": "2026-09-15T10:42:18Z",
   "score": 60,
@@ -267,6 +278,20 @@ guards came from auditing real sites:
    read as `p=none`. A naive `grep p=` would pick up the `sp=` value.
 6. **Cookie flags.** Flags are matched as attributes, so a cookie *named*
    `secure_token` does not count as `Secure`.
+7. **Apex-to-www redirects.** Security headers are read from the page the site
+   actually serves. If the apex 301s to `www.` (or http to https), `site-audit`
+   follows that one same-site hop before reading headers, so a bare redirect is
+   not reported as "all headers missing". Off-site redirects are not trusted:
+   the origin's own headers are used instead.
+8. **SPF `redirect=`.** A record such as `v=spf1 redirect=icann.org` delegates
+   its policy to another domain. That is valid configuration, so it is reported
+   as OK rather than "no `-all`".
+9. **Private/loopback A records.** If a domain resolves to a loopback or
+   RFC 1918 address, port probing would scan the local network rather than the
+   site, so it is skipped and reported as "not testable".
+10. **Customer sign-in pages.** Only admin-specific paths (`/wp-admin`,
+    `/administrator`, `/phpmyadmin`, `/manager`...) are flagged. A normal
+    `/login` or `/signin` for end users is not treated as an exposed admin door.
 
 ## Design notes
 
@@ -291,7 +316,9 @@ guards came from auditing real sites:
   escape `|`. The domain argument is validated against RFC 1123 before it ever
   reaches a command.
 - **Fast.** The 25 port probes run in parallel (worst case about 3 s rather
-  than about 75 s). A typical full audit finishes in 3-10 seconds.
+  than about 75 s). A typical full audit finishes in a few seconds; it can take
+  ~15 s against a slow origin or one that stalls the TLS handshake (each network
+  request is bounded by `--timeout`, default 12 s).
 
 ## Development
 
@@ -319,7 +346,7 @@ The test suite is plain Bash with no framework:
 ```text
 $ bash tests/run.sh
 ...
-185 passed, 0 failed, 1 skipped
+240 passed, 0 failed, 1 skipped
 ```
 
 CI runs ShellCheck and the full offline suite on every push
@@ -334,17 +361,18 @@ CI runs ShellCheck and the full offline suite on every push
 - **DKIM selectors can't be listed from outside.** Only 19 common selectors
   are tried, so a custom selector shows up as a "none found" warning.
 - **IPv4, first A record.** IPv6 and additional A records are not probed.
-- **Homepage headers.** Security headers and cookies are read from the
-  response to `https://<domain>/` without following redirects. Pages deeper in
-  the site may differ.
+- **Homepage headers.** Security headers and cookies are read from the page the
+  site serves for `https://<domain>/`, following at most one same-site redirect
+  (apex to `www.`, http to https). Pages deeper in the site may differ.
 - **TCP connect only.** Open ports are detected but services are not
   fingerprinted.
 - **WAFs and rate limits** may block some requests. Blocked requests show up
   as `000`/`403` and can hide findings.
 - **`www.` is stripped** from the input, so the apex domain is audited.
-- **GNU userland assumed.** On macOS, install coreutils (`timeout`) and a
-  current Bash. Certificate date parsing falls back to BSD `date`
-  automatically.
+- **Userland portability.** GNU coreutils are assumed. On macOS, install
+  coreutils (its `timeout` is `gtimeout`; put its gnubin on `PATH`) and a
+  current Bash. Certificate date parsing falls back automatically to BSD `date`
+  (macOS) and to a busybox-compatible parser (Alpine).
 
 ## Roadmap
 

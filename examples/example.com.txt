@@ -24,7 +24,7 @@ Warnings - should fix
 
 Passed - already good
 --------------------------------------------------------------
-  [ OK ] Domain resolves                  104.20.23.154
+  [ OK ] Domain resolves                  172.66.147.243
   [ OK ] SPF record                       present, strict (-all)
   [ OK ] DMARC policy                     p=reject
   [ OK ] HTTPS available                  https answers (200)
@@ -32,7 +32,7 @@ Passed - already good
   [ OK ] Certificate trusted              chain and name verify
   [ OK ] Software version hidden          cloudflare
   [ OK ] Sensitive files exposed          none of the common ones
-  [ OK ] Admin login pages reachable      none at common paths
+  [ OK ] Admin login pages reachable      none at common admin paths
 
 Info - for reference
 --------------------------------------------------------------
@@ -45,4 +45,3 @@ Info - for reference
   [INFO] Open ports                       behind Cloudflare - origin server is hidden
                                           -> Good: attackers cannot reach the server directly either. Ports on this IP belong to Cloudflare's network, not to this site.
 
-Saved markdown report: examples/example.com.md

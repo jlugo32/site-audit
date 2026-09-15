@@ -68,6 +68,8 @@ assert_eq example.com     "$(normalize_domain https://www.Example.COM/)"    "sch
 assert_eq example.com     "$(normalize_domain 'example.com.')"              "trailing root dot removed"
 assert_eq shop.example.co.uk "$(normalize_domain shop.example.co.uk)"       "multi-label subdomain accepted"
 assert_eq xn--bcher-kva.example "$(normalize_domain xn--bcher-kva.example)" "punycode label accepted"
+assert_eq example.com     "$(normalize_domain 'Https://example.com')"        "mixed-case Https:// scheme stripped"
+assert_eq example.com     "$(normalize_domain 'HtTp://www.Example.com/')"    "mixed-case HtTp:// scheme stripped"
 # shellcheck disable=SC2016  # the literal $(id) is the point of the test
 for bad in "https://example.com/admin" "example.com?x=1" "example.com:8080" "user@example.com" \
            "192.0.2.1" "localhost" "exa mple.com" 'example.com;id' '$(id).example.com' \
@@ -92,6 +94,10 @@ assert_eq pass-all "$(spf_all_qualifier 'v=spf1 +all')"      "+all passes everyo
 assert_eq pass-all "$(spf_all_qualifier 'v=spf1 a all')"     "bare all defaults to +all"
 assert_eq none     "$(spf_all_qualifier 'v=spf1 include:x')" "no all mechanism"
 assert_eq none     "$(spf_all_qualifier 'v=spf1 include:mall.example.net')" "'all' inside a hostname is not a mechanism"
+assert_eq strict   "$(spf_all_qualifier 'v=spf1 mx -ALL')"   "uppercase -ALL is still strict"
+assert_eq redirect "$(spf_all_qualifier 'v=spf1 redirect=icann.org')" "redirect= is a valid delegation, not a misconfig"
+assert_eq redirect "$(spf_all_qualifier 'v=spf1 redirect=_spf.example.net')" "redirect= without all is delegated"
+assert_eq strict   "$(spf_all_qualifier 'v=spf1 redirect=x -all')" "an explicit -all still wins over redirect="
 
 section "DMARC parsing"
 assert_eq reject "$(dmarc_tag 'v=DMARC1; p=reject; rua=mailto:r@example.com' p)" "p= read"
@@ -136,6 +142,33 @@ assert_eq "Self Signed Root" "$(parse_cert_issuer 'issuer=CN = Self Signed Root'
 NOW="$(to_epoch 'Jan  1 00:00:00 2030 GMT')"
 assert_eq 30  "$(days_until 'Jan 31 00:00:00 2030 GMT' "$NOW")" "days until expiry"
 assert_eq -31 "$(days_until 'Dec  1 00:00:00 2029 GMT' "$NOW")" "negative when expired"
+# busybox/Alpine date parses neither GNU -d nor BSD -j -f; the pure fallback must
+# yield the same epoch (bug 7).
+assert_eq "$(date -u -d 'Oct 27 22:17:21 2026 GMT' +%s)" "$(epoch_fallback 'Oct 27 22:17:21 2026 GMT')" "epoch fallback matches GNU date"
+assert_eq "$(date -u -d 'Jan  1 00:00:00 2030 GMT' +%s)" "$(epoch_fallback 'Jan  1 00:00:00 2030 GMT')" "epoch fallback handles space-padded day"
+assert_fail "epoch fallback rejects a bad month" epoch_fallback "Xxx 1 00:00:00 2030 GMT"
+assert_eq "self-signed certificate" "$(verify_human 18)" "verify code 18 -> self-signed"
+assert_eq "certificate has expired" "$(verify_human 10)" "verify code 10 -> expired"
+assert_eq "certificate name does not match the host" "$(verify_human 62)" "verify code 62 -> name mismatch"
+assert_contains "$(verify_human 1)" "name mismatch or untrusted" "unknown verify code maps to a human reason"
+
+section "same-site and private-address helpers"
+assert_ok   "apex matches its www"        is_same_site iana.org www.iana.org
+assert_ok   "www matches its apex"        is_same_site www.iana.org iana.org
+assert_ok   "identical hosts match"       is_same_site example.com example.com
+assert_fail "different sites do not match" is_same_site iana.org evil.example
+assert_fail "subdomain is not the apex"   is_same_site example.com blog.example.com
+assert_ok   "127.0.0.1 is loopback"       is_private_ip 127.0.0.1
+assert_ok   "10.x is RFC 1918"            is_private_ip 10.1.2.3
+assert_ok   "192.168.x is RFC 1918"      is_private_ip 192.168.0.5
+assert_ok   "172.16.x is RFC 1918"       is_private_ip 172.16.4.4
+assert_ok   "172.31.x is RFC 1918"       is_private_ip 172.31.255.1
+assert_ok   "169.254.x is link-local"    is_private_ip 169.254.1.1
+assert_ok   "::1 is loopback"            is_private_ip ::1
+assert_ok   "fd00 is IPv6 ULA"           is_private_ip fd00:1234::1
+assert_fail "172.32.x is public"         is_private_ip 172.32.0.1
+assert_fail "8.8.8.8 is public"          is_private_ip 8.8.8.8
+assert_fail "192.0.2.10 is public"       is_private_ip 192.0.2.10
 
 section "exposed-file signatures (false-positive guards)"
 assert_ok   ".env body recognised"                  body_matches_signature .env "$FIX/body-env.txt"
@@ -197,6 +230,10 @@ http_headers() {
     http://*)  printf 'HTTP/1.1 %s Moved\nLocation: %s\n' "$STUB_HTTP" "$STUB_LOCATION" ;;
   esac
 }
+# Redirect-following security-header read. Offline it resolves to the same
+# fixture as the https headers; the same-site redirect logic is unit-tested via
+# is_same_site and covered live against iana.org.
+http_security_headers() { cat "$STUB_HEADERS"; }
 http_body_to() {  # url outfile max
   local path="${1#https://"$DOMAIN"/}" spec code file
   spec="${STUB_BODIES[$path]:-$STUB_DEFAULT_BODY}"
@@ -271,6 +308,27 @@ scenario_redirect_http()     { STUB_LOCATION="http://www.example.org/"; }
 scenario_expiring()          { STUB_CERT_END="$(date -u -d '+5 days' '+%b %e %H:%M:%S %Y GMT' 2>/dev/null || date -u -v+5d '+%b %e %H:%M:%S %Y GMT')"; }
 scenario_dkim_revoked()      { dns_query() { case "$1 $2" in "A $DOMAIN") echo "$STUB_A" ;; "TXT "*._domainkey.*) echo '"v=DKIM1; p="' ;; esac; return 0; }; }
 scenario_no_https()          { STUB_HTTPS=000; STUB_TXT='"v=spf1 -all"'; STUB_DMARC='"v=DMARC1; p=reject; rua=mailto:r@example.org"'; }
+# bug 5: a domain pointed at a private/loopback address must not be port-probed.
+scenario_private_ip() {
+  scenario_hardened
+  STUB_A="10.1.2.3"; STUB_LOCAL_IPS="203.0.113.9"
+  STUB_OPEN_PORTS="$PROBE_PORTS"; STUB_PROBE_MARKER="$TMP_T/probed-priv"
+}
+# bug 6: a normal customer /login (or /signin) is not an admin page.
+scenario_customer_login() {
+  scenario_hardened
+  STUB_BODIES[login]="200 body-login.html"
+  STUB_BODIES[signin]="200 body-login.html"
+}
+# bug 8c: DMARC p=reject but pct=0 only monitors most mail.
+scenario_dmarc_pct0() {
+  scenario_hardened
+  STUB_DMARC='"v=DMARC1; p=reject; pct=0; rua=mailto:r@example.org"'
+}
+# bug 4: TLS handshake never completed -> trust cannot be asserted.
+scenario_cert_unreachable() { scenario_hardened; STUB_VERIFY="unreachable"; }
+# bug 8e: an untrusted verify code is mapped to human-readable text.
+scenario_cert_selfsigned()  { scenario_hardened; STUB_VERIFY=18; }
 
 check_scenario() {  # name setup expected_header_line [expected finding lines...] [--absent line...]
   local name="$1" setup="$2" header="$3" out status line mode=present
@@ -299,12 +357,12 @@ check_scenario hardened scenario_hardened "SCORE=100 GRADE=A CRIT=0 WARN=0 RESOL
   --absent "WARNING|" "CRITICAL|"
 
 section "fixture audit: neglected site"
-check_scenario weak scenario_weak "SCORE=0 GRADE=F CRIT=7 WARN=10 RESOLVED=1" \
+check_scenario weak scenario_weak "SCORE=0 GRADE=F CRIT=6 WARN=10 RESOLVED=1" \
   "CRITICAL|SPF record|missing" \
   "CRITICAL|DMARC policy|missing" \
   "CRITICAL|Forces HTTPS|plain http serves the full site" \
   "CRITICAL|Certificate valid|EXPIRED" \
-  "CRITICAL|Certificate trusted|verify result 10" \
+  "INFO|Certificate trusted|verify: certificate has expired" \
   "CRITICAL|Risky ports open to the internet|21/FTP 3306/MySQL" \
   "CRITICAL|Sensitive files exposed|.env" \
   "WARNING|Software version hidden|leaks: Server: Apache/2.4.41 (Ubuntu) X-Powered-By: PHP/7.4.3" \
@@ -322,7 +380,7 @@ check_scenario cdn scenario_cdn_catchall "SCORE=55 GRADE=D CRIT=1 WARN=6 RESOLVE
   "WARNING|DMARC reporting|no rua= address" \
   "INFO|Open ports|behind Cloudflare - origin server is hidden" \
   "OK|Sensitive files exposed|none of the common ones" \
-  "OK|Admin login pages reachable|none at common paths" \
+  "OK|Admin login pages reachable|none at common admin paths" \
   --absent "WARNING|WordPress xmlrpc.php" "CRITICAL|Risky ports"
 if [[ -e "$TMP_T/probed" ]]; then fail "cdn: no TCP probes sent to a CDN edge"; else pass "cdn: no TCP probes sent to a CDN edge"; fi
 
@@ -351,6 +409,23 @@ check_scenario no-https scenario_no_https "SCORE=80 GRADE=B CRIT=1 WARN=1 RESOLV
   "CRITICAL|HTTPS available|site does not answer on https" \
   --absent "OK|Certificate" "OK|HSTS" "OK|Sensitive files"
 
+section "fixture audit: bug regression guards"
+check_scenario private-ip scenario_private_ip "SCORE=100 GRADE=A CRIT=0 WARN=0 RESOLVED=1" \
+  "INFO|Open ports|not testable - resolves to a private/loopback address (10.1.2.3)" \
+  --absent "CRITICAL|Risky ports" "OK|Risky ports"
+if [[ -e "$TMP_T/probed-priv" ]]; then fail "private-ip: no TCP probes sent to a private address"; else pass "private-ip: no TCP probes sent to a private address"; fi
+check_scenario customer-login scenario_customer_login "SCORE=100 GRADE=A CRIT=0 WARN=0 RESOLVED=1" \
+  "OK|Admin login pages reachable|none at common admin paths" \
+  --absent "WARNING|Admin login pages reachable"
+check_scenario dmarc-pct0 scenario_dmarc_pct0 "SCORE=95 GRADE=A CRIT=0 WARN=1 RESOLVED=1" \
+  "OK|DMARC policy|p=reject" \
+  "WARNING|DMARC coverage|pct=0"
+check_scenario cert-unreachable scenario_cert_unreachable "SCORE=95 GRADE=A CRIT=0 WARN=1 RESOLVED=1" \
+  "WARNING|Certificate trusted|could not verify (no TLS handshake)" \
+  --absent "OK|Certificate trusted"
+check_scenario cert-selfsigned scenario_cert_selfsigned "SCORE=85 GRADE=B CRIT=1 WARN=0 RESOLVED=1" \
+  "CRITICAL|Certificate trusted|self-signed certificate"
+
 # ------------------------------------------------------------------ CLI tests
 section "command line (no network needed)"
 run_cli() { CLI_OUT="$("$@" 2>&1)"; CLI_STATUS=$?; }
@@ -373,6 +448,14 @@ run_cli bash "$SCRIPT" example.com example.org
 assert_eq 2 "$CLI_STATUS" "two domains exit 2"
 run_cli bash "$SCRIPT" example.com --md /nonexistent-dir/report.md
 assert_eq 2 "$CLI_STATUS" "unwritable --md path exits 2"
+run_cli bash "$SCRIPT" example.com --md=
+assert_eq 2 "$CLI_STATUS" "empty --md= exits 2 (not silently ignored)"
+run_cli bash "$SCRIPT" example.com --fail-under=
+assert_eq 2 "$CLI_STATUS" "empty --fail-under= exits 2 (not silently ignored)"
+run_cli bash "$SCRIPT" example.com --timeout=
+assert_eq 2 "$CLI_STATUS" "empty --timeout= exits 2 (not silently ignored)"
+run_cli bash "$SCRIPT" 'Https://example.com/wp-admin'
+assert_eq 2 "$CLI_STATUS" "mixed-case scheme with a path is still rejected"
 
 FAKEBIN="$TMP_T/bin"; mkdir -p "$FAKEBIN"
 for c in bash curl openssl timeout awk sed tr date mktemp; do
@@ -407,6 +490,20 @@ NR_OUT="$(main_stubbed scenario_no_resolve example.org --json 2>/dev/null)"; st=
 assert_eq 4 "$st" "unresolvable domain exits 4"
 assert_contains "$NR_OUT" '"error": "domain does not resolve"' "unresolvable domain still emits JSON"
 
+# bug 1: a run that aborts before a successful audit must NOT touch an existing --md file.
+printf 'precious\n' > "$TMP_T/keep.md"
+main_stubbed scenario_no_resolve example.org --md "$TMP_T/keep.md" >/dev/null 2>&1; st=$?
+assert_eq 4 "$st" "no-resolve run with --md still exits 4"
+assert_eq "precious" "$(cat "$TMP_T/keep.md")" "aborted run leaves an existing --md file untouched (not truncated)"
+
+# bug 1: --json and --md FILE together must produce BOTH outputs.
+JM_OUT="$(main_stubbed scenario_cdn_catchall example.org --json --md "$TMP_T/both.md" 2>/dev/null)"; st=$?
+assert_eq 0 "$st" "--json --md FILE exits 0"
+assert_contains "$JM_OUT" '"tool": "site-audit"' "--json --md FILE prints JSON on stdout"
+assert_not_contains "$JM_OUT" "Saved markdown report" "the saved-report notice stays off JSON stdout"
+JM_MD="$(cat "$TMP_T/both.md" 2>/dev/null)"
+assert_contains "$JM_MD" "| Check | Result | Why it matters |" "--json --md FILE also writes the markdown file (not 0 bytes)"
+
 TERM_OUT="$(main_stubbed scenario_weak example.org --no-color --md "$TMP_T/r.md" 2>&1)"
 assert_contains "$TERM_OUT" "Score: 0/100" "terminal report shows score"
 assert_not_contains "$TERM_OUT" $'\e[' "--no-color output has no ANSI escapes"
@@ -432,6 +529,15 @@ if [[ "${LIVE:-0}" == 1 ]]; then
   assert_eq 0 "$st" "live: example.com audit exits 0"
   assert_contains "$LIVE_OUT" '"domain": "example.com"' "live: JSON names the domain"
   assert_contains "$LIVE_OUT" '"check": "HTTPS available"' "live: HTTPS check ran"
+
+  # bug 2 + bug 3: iana.org publishes "v=spf1 redirect=icann.org" and its apex
+  # 301s to www (where the security headers live).
+  IANA_OUT="$(bash "$SCRIPT" iana.org --json --no-ports 2>&1)"; st=$?
+  assert_eq 0 "$st" "live: iana.org audit exits 0"
+  assert_contains "$IANA_OUT" '"result": "present, delegated (redirect=)"' "live: SPF redirect= is OK, not a warning (bug 2)"
+  assert_not_contains "$IANA_OUT" '"result": "present but no -all/~all"' "live: iana SPF no longer mis-flagged (bug 2)"
+  assert_contains "$IANA_OUT" '"check": "HSTS header", "result": "max-age' "live: HSTS read from the www page after the apex redirect (bug 3)"
+  assert_contains "$IANA_OUT" '"check": "Clickjacking protection", "result": "DENY"' "live: X-Frame-Options read after redirect (bug 3)"
 else
   skip "live example.com audit (set LIVE=1 to enable)"
 fi

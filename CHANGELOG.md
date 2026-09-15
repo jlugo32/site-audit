@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-15
+
+Bug-fix release. Focus on real-world false positives and data-loss safety.
+
+### Fixed
+- **`--md FILE` no longer destroys the target file.** The report is now built in
+  memory and written atomically (temp file + rename) only after a successful
+  audit, so a run that aborts (for example, a domain that does not resolve)
+  leaves an existing file untouched. The write no longer truncated the file up
+  front.
+- **`--json` and `--md FILE` now work together.** Both outputs are produced:
+  JSON on stdout and the markdown report in the file. Previously the markdown
+  file was left empty when `--json` was set. The "Saved markdown report" notice
+  now goes to stderr so it never pollutes JSON on stdout.
+- **SPF `redirect=` is recognised.** A record such as
+  `v=spf1 redirect=icann.org` (as IANA publishes) is reported as a valid
+  delegation instead of "present but no `-all`". Uppercase `-ALL` is also
+  handled.
+- **Security headers survive an apex-to-www redirect.** Headers are read from
+  the final page after following one same-site redirect (apex to `www.`, http to
+  https), instead of reading the bare 301 and reporting HSTS/CSP/X-Frame-Options
+  as missing. Off-site redirects are not trusted.
+- **Certificate trust no longer fails open on a timeout.** A `ssl_verify_result`
+  of 0 with no completed handshake is reported as "could not verify" rather than
+  "trusted".
+- **Port scan skips private/loopback A records.** A domain resolving to
+  127/8, ::1, RFC 1918, link-local or IPv6 ULA is marked "not testable" instead
+  of scanning the local machine or network.
+- **Normal customer sign-in pages are no longer flagged.** Only admin-specific
+  paths (`/wp-admin`, `/administrator`, `/phpmyadmin`, `/manager`...) count; a
+  bare `/login` or `/signin` no longer trips "Admin login pages reachable".
+- **Alpine/busybox certificate dates parse correctly.** Added a
+  busybox-compatible fallback so `date` that understands neither GNU `-d` nor
+  BSD `-j -f` no longer yields a false "could not read certificate". `hostname -I`
+  now falls back to `ip addr`/`ifconfig` for the self-host guard.
+
+### Changed
+- Certificate verify codes are mapped to human-readable text (self-signed, name
+  mismatch, expired, untrusted chain) instead of a raw number.
+- An expired certificate is counted once, not twice (was flagged by both the
+  validity and the trust check).
+- DMARC `p=reject`/`quarantine` with `pct` below 100 is flagged as weakened
+  coverage rather than treated as full-strength.
+- Empty option values (`--md=`, `--fail-under=`, `--timeout=`) are rejected with
+  exit code 2 instead of being silently ignored. A mixed-case scheme
+  (`Https://`) is stripped correctly rather than rejected with the wrong reason.
+- macOS dependency hint reconciled between the script and the README (Bash 4.4+
+  and coreutils' `gtimeout`). Documented that `--timeout` is per request.
+
 ## [1.0.0] - 2026-09-15
 
 First public release.

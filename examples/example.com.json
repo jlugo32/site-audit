@@ -1,13 +1,13 @@
 {
   "tool": "site-audit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "domain": "example.com",
-  "generated_at": "2026-09-15T10:42:18Z",
+  "generated_at": "2026-09-15T13:34:05Z",
   "score": 60,
   "grade": "C",
   "summary": {"critical": 1, "warning": 5, "ok": 9, "info": 4},
   "findings": [
-    {"severity": "OK", "check": "Domain resolves", "result": "104.20.23.154", "why": "The site has an address on the internet.", "penalty": 0},
+    {"severity": "OK", "check": "Domain resolves", "result": "172.66.147.243", "why": "The site has an address on the internet.", "penalty": 0},
     {"severity": "INFO", "check": "Email (MX) configured", "result": "null MX (accepts no mail)", "why": "The domain explicitly says it never receives email. Spoofing protection below still matters for SENDING.", "penalty": 0},
     {"severity": "OK", "check": "SPF record", "result": "present, strict (-all)", "why": "Receivers are told to reject mail from unlisted servers.", "penalty": 0},
     {"severity": "INFO", "check": "DKIM signing key", "result": "only empty/revoked keys (p=)", "why": "An empty key tells receivers this domain does not sign mail. Correct for a domain that sends no email; a problem if it does.", "penalty": 0},
@@ -25,6 +25,6 @@
     {"severity": "OK", "check": "Software version hidden", "result": "cloudflare", "why": "Attackers are not told which software or version is running.", "penalty": 0},
     {"severity": "INFO", "check": "Open ports", "result": "behind Cloudflare - origin server is hidden", "why": "Good: attackers cannot reach the server directly either. Ports on this IP belong to Cloudflare's network, not to this site.", "penalty": 0},
     {"severity": "OK", "check": "Sensitive files exposed", "result": "none of the common ones", "why": "Config, backup and source-control files are not downloadable.", "penalty": 0},
-    {"severity": "OK", "check": "Admin login pages reachable", "result": "none at common paths", "why": "No obvious admin door on the front of the site.", "penalty": 0}
+    {"severity": "OK", "check": "Admin login pages reachable", "result": "none at common admin paths", "why": "No obvious admin door on the front of the site.", "penalty": 0}
   ]
 }
